@@ -1,0 +1,16 @@
+[package]
+name = "dnsbl-server"
+version = "1.0.0"
+edition = "2021"
+authors = ["Philippe TEMESI"]
+description = "Un serveur DNSBL simple en Rust"
+license = "MIT"
+homepage = "https://www.tems.be"
+
+[dependencies]
+clap = "2.34"
+daemonize = "0.4.1"
+ipnetwork = "0.20"
+fern = "0.6"
+log = "0.4"
+chrono = "0.4"
