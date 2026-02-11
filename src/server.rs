@@ -4,13 +4,15 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 use clap::{App, Arg};
 use daemonize::Daemonize;
 use ipnetwork::Ipv4Network;
 use log::{info, warn, error, debug};
+use reqwest::blocking::Client;
+use url::Url;
 
 // Structure for storing blocked IPs
 #[derive(Debug, Clone)]
@@ -29,8 +31,13 @@ impl DNSBLServer {
         }
     }
 
-    // Load IPs from multiple files
-    fn load_blocklists(&self, filenames: &[String]) -> io::Result<()> {
+    // Check if a string is a URL
+    fn is_url(s: &str) -> bool {
+        s.starts_with("http://") || s.starts_with("https://")
+    }
+
+    // Load IPs from multiple sources (files or URLs)
+    fn load_blocklists(&self, sources: &[String]) -> io::Result<()> {
         let mut ips = self.blocked_ips.write().unwrap();
         let mut ranges = self.blocked_ranges.write().unwrap();
         
@@ -40,27 +47,43 @@ impl DNSBLServer {
         let mut total_ips = 0;
         let mut total_ranges = 0;
         
-        for filename in filenames {
-            match self.load_single_blocklist(filename) {
-                Ok((file_ips, file_ranges)) => {
-                    total_ips += file_ips;
-                    total_ranges += file_ranges;
-                    info!("Loaded {} IPs and {} CIDR ranges from {}", 
-                          file_ips, file_ranges, filename);
+        for source in sources {
+            if Self::is_url(source) {
+                match self.load_from_url(source) {
+                    Ok((url_ips, url_ranges)) => {
+                        total_ips += url_ips;
+                        total_ranges += url_ranges;
+                        info!("Loaded {} IPs and {} CIDR ranges from URL: {}", 
+                              url_ips, url_ranges, source);
+                    }
+                    Err(e) => {
+                        error!("Error loading blocklist from URL {}: {}", source, e);
+                        return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                    }
                 }
-                Err(e) => {
-                    error!("Error loading blocklist file {}: {}", filename, e);
-                    return Err(e);
+            } else {
+                match self.load_from_file(source) {
+                    Ok((file_ips, file_ranges)) => {
+                        total_ips += file_ips;
+                        total_ranges += file_ranges;
+                        info!("Loaded {} IPs and {} CIDR ranges from file: {}", 
+                              file_ips, file_ranges, source);
+                    }
+                    Err(e) => {
+                        error!("Error loading blocklist file {}: {}", source, e);
+                        return Err(e);
+                    }
                 }
             }
         }
         
-        info!("Total blocklist loaded: {} IPs, {} CIDR ranges", total_ips, total_ranges);
+        info!("Total blocklist loaded: {} IPs, {} CIDR ranges from {} source(s)", 
+              total_ips, total_ranges, sources.len());
         Ok(())
     }
     
-    // Load IPs from a single file
-    fn load_single_blocklist(&self, filename: &str) -> io::Result<(usize, usize)> {
+    // Load IPs from a local file
+    fn load_from_file(&self, filename: &str) -> io::Result<(usize, usize)> {
         let path = Path::new(filename);
         if !path.exists() {
             return Err(io::Error::new(
@@ -70,7 +93,7 @@ impl DNSBLServer {
         }
         
         let file = File::open(filename)?;
-        let reader = io::BufReader::new(file);
+        let reader = BufReader::new(file);
         
         let mut ips = self.blocked_ips.write().unwrap();
         let mut ranges = self.blocked_ranges.write().unwrap();
@@ -106,6 +129,76 @@ impl DNSBLServer {
         }
         
         Ok((file_ips, file_ranges))
+    }
+    
+    // Load IPs from a URL (HTTP/HTTPS)
+    fn load_from_url(&self, url: &str) -> Result<(usize, usize), String> {
+        // Validate URL
+        let parsed_url = Url::parse(url)
+            .map_err(|e| format!("Invalid URL {}: {}", url, e))?;
+        
+        if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+            return Err(format!("Unsupported URL scheme: {}. Use http:// or https://", parsed_url.scheme()));
+        }
+        
+        info!("Downloading blocklist from {}", url);
+        
+        // Create HTTP client with timeout
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("DNSBL-Server/1.0 (https://www.tems.be)")
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        
+        // Download the content
+        let response = client.get(url)
+            .send()
+            .map_err(|e| format!("Failed to download {}: {}", url, e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("HTTP error {} when downloading {}", response.status(), url));
+        }
+        
+        let content = response.text()
+            .map_err(|e| format!("Failed to read response body from {}: {}", url, e))?;
+        
+        debug!("Downloaded {} bytes from {}", content.len(), url);
+        
+        // Parse the content
+        let mut ips = self.blocked_ips.write().unwrap();
+        let mut ranges = self.blocked_ranges.write().unwrap();
+        
+        let mut url_ips = 0;
+        let mut url_ranges = 0;
+        
+        for (line_num, line) in content.lines().enumerate() {
+            let line = line.trim();
+            
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            
+            // Try to parse as CIDR
+            if let Ok(network) = Ipv4Network::from_str(line) {
+                ranges.push(network);
+                url_ranges += 1;
+                debug!("Added CIDR range from {}: {}", url, network);
+            } 
+            // Try as simple IP
+            else if let Ok(ip) = Ipv4Addr::from_str(line) {
+                if ips.insert(ip) {
+                    url_ips += 1;
+                    debug!("Added IP from {}: {}", url, ip);
+                } else {
+                    debug!("Duplicate IP from {}: {} (skipped)", url, ip);
+                }
+            } else {
+                warn!("Invalid line {} in {}: {}", line_num + 1, url, line);
+            }
+        }
+        
+        Ok((url_ips, url_ranges))
     }
 
     // Check if an IP is blocked
@@ -379,13 +472,13 @@ fn main() {
     let matches = App::new("DNSBL Server")
         .version("1.0")
         .author("Philippe TEMESI")
-        .about("A simple DNSBL server in Rust")
+        .about("A simple DNSBL server in Rust with support for local files and HTTP/HTTPS blocklists")
         .arg(
             Arg::with_name("file")
                 .short("f")
                 .long("file")
-                .value_name("FILE")
-                .help("Text file(s) containing the blocklist (can be specified multiple times)")
+                .value_name("SOURCE")
+                .help("Blocklist source: local file path or HTTP/HTTPS URL (can be specified multiple times)")
                 .takes_value(true)
                 .multiple(true)
                 .required(true)
@@ -428,7 +521,7 @@ fn main() {
                 .help("Log file")
                 .takes_value(true)
         )
-        .after_help("2026, Philippe TEMESI - https://www.tems.be\n\nExamples:\n  dnsbl-server -f blocklist1.txt -f blocklist2.txt\n  dnsbl-server -f blocklist1.txt -f blocklist2.txt -f blocklist3.txt -i 127.0.0.1:5453")
+        .after_help("2026, Philippe TEMESI - https://www.tems.be\n\nExamples:\n  # Local files only\n  dnsbl-server -f blocklist.txt -f custom.txt\n\n  # HTTP/HTTPS URLs only\n  dnsbl-server -f http://www.spamhaus.org/drop/drop.txt -f https://rules.emergingthreats.net/fwrules/emerging-Block-IPs.txt\n\n  # Mixed local files and URLs\n  dnsbl-server -f blocklist.txt -f http://www.spamhaus.org/drop/drop.txt -f https://my-server.com/blocklist.txt\n\n  # With custom port\n  dnsbl-server -f blocklist.txt -f https://example.com/list.txt -i 127.0.0.1:5453 -v")
         .get_matches();
 
     // Daemon mode
@@ -460,21 +553,25 @@ fn main() {
     info!("DNSBL Server v1.0 - 2026, Philippe TEMESI");
     info!("Website: https://www.tems.be");
     
-    // Get all file arguments
-    let blocklist_files: Vec<String> = matches.values_of_lossy("file").unwrap();
+    // Get all source arguments
+    let sources: Vec<String> = matches.values_of_lossy("file").unwrap();
     
-    info!("Loading {} blocklist file(s):", blocklist_files.len());
-    for (i, file) in blocklist_files.iter().enumerate() {
-        info!("  {}. {}", i + 1, file);
+    info!("Loading {} blocklist source(s):", sources.len());
+    for (i, source) in sources.iter().enumerate() {
+        if DNSBLServer::is_url(source) {
+            info!("  {}. [URL] {}", i + 1, source);
+        } else {
+            info!("  {}. [FILE] {}", i + 1, source);
+        }
     }
     
     // Create server
     let domain = matches.value_of("domain").unwrap();
     let dnsbl_server = DNSBLServer::new(domain);
     
-    // Load blocklists
-    if let Err(e) = dnsbl_server.load_blocklists(&blocklist_files) {
-        error!("Error loading blocklist file(s): {}", e);
+    // Load blocklists from all sources
+    if let Err(e) = dnsbl_server.load_blocklists(&sources) {
+        error!("Error loading blocklist source(s): {}", e);
         std::process::exit(1);
     }
     

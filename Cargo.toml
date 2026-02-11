@@ -1,10 +1,10 @@
 [package]
 name = "dnsbl-server"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 authors = ["Philippe TEMESI"]
-description = "A complete DNSBL toolkit: server and query client"
-license = "MIT"
+description = "A complete DNSBL toolkit: server with HTTP/HTTPS support and query client"
+license = "GPL"
 homepage = "https://www.tems.be"
 
 [[bin]]
@@ -17,11 +17,12 @@ path = "src/query.rs"
 
 [dependencies]
 clap = "2.34"
-daemonize = "0.4"
+daemonize = "0.5"
 ipnetwork = "0.20"
 fern = "0.6"
 log = "0.4"
 chrono = "0.4"
 rand = "0.8"
 trust-dns-proto = "0.23"
-
+reqwest = { version = "0.11", features = ["blocking"] }
+url = "2.5"
