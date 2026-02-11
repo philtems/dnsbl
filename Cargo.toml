@@ -3,9 +3,17 @@ name = "dnsbl-server"
 version = "1.0.0"
 edition = "2021"
 authors = ["Philippe TEMESI"]
-description = "A simple DNSBL server in Rust"
+description = "A complete DNSBL toolkit: server and query client"
 license = "MIT"
 homepage = "https://www.tems.be"
+
+[[bin]]
+name = "dnsbl-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "dnsbl-query"
+path = "src/query.rs"
 
 [dependencies]
 clap = "2.34"
@@ -14,3 +22,6 @@ ipnetwork = "0.20"
 fern = "0.6"
 log = "0.4"
 chrono = "0.4"
+rand = "0.8"
+trust-dns-proto = "0.23"
+
