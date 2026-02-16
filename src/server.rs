@@ -38,12 +38,6 @@ impl DNSBLServer {
 
     // Load IPs from multiple sources (files or URLs)
     fn load_blocklists(&self, sources: &[String]) -> io::Result<()> {
-        let mut ips = self.blocked_ips.write().unwrap();
-        let mut ranges = self.blocked_ranges.write().unwrap();
-        
-        ips.clear();
-        ranges.clear();
-        
         let mut total_ips = 0;
         let mut total_ranges = 0;
         
@@ -77,8 +71,14 @@ impl DNSBLServer {
             }
         }
         
-        info!("Total blocklist loaded: {} IPs, {} CIDR ranges from {} source(s)", 
-              total_ips, total_ranges, sources.len());
+        // Afficher le résumé après le chargement de toutes les sources
+        {
+            let ips = self.blocked_ips.read().unwrap();
+            let ranges = self.blocked_ranges.read().unwrap();
+            info!("Total blocklist loaded: {} IPs, {} CIDR ranges from {} source(s)", 
+                  ips.len(), ranges.len(), sources.len());
+        }
+        
         Ok(())
     }
     
@@ -95,11 +95,10 @@ impl DNSBLServer {
         let file = File::open(filename)?;
         let reader = BufReader::new(file);
         
-        let mut ips = self.blocked_ips.write().unwrap();
-        let mut ranges = self.blocked_ranges.write().unwrap();
-        
         let mut file_ips = 0;
         let mut file_ranges = 0;
+        let mut new_ips = HashSet::new();
+        let mut new_ranges = Vec::new();
         
         for (line_num, line) in reader.lines().enumerate() {
             let line = line?.trim().to_string();
@@ -111,13 +110,13 @@ impl DNSBLServer {
             
             // Try to parse as CIDR
             if let Ok(network) = Ipv4Network::from_str(&line) {
-                ranges.push(network);
+                new_ranges.push(network);
                 file_ranges += 1;
                 debug!("Added CIDR range from {}: {}", filename, network);
             } 
             // Try as simple IP
             else if let Ok(ip) = Ipv4Addr::from_str(&line) {
-                if ips.insert(ip) {
+                if new_ips.insert(ip) {
                     file_ips += 1;
                     debug!("Added IP from {}: {}", filename, ip);
                 } else {
@@ -127,6 +126,19 @@ impl DNSBLServer {
                 warn!("Invalid line {} in {}: {}", line_num + 1, filename, line);
             }
         }
+        
+        // Mettre à jour les structures partagées en une seule opération
+        {
+            let mut ips = self.blocked_ips.write().unwrap();
+            let mut ranges = self.blocked_ranges.write().unwrap();
+            
+            for ip in new_ips {
+                ips.insert(ip);
+            }
+            for range in new_ranges {
+                ranges.push(range);
+            }
+        } // Les verrous sont automatiquement relâchés ici
         
         Ok((file_ips, file_ranges))
     }
@@ -165,11 +177,10 @@ impl DNSBLServer {
         debug!("Downloaded {} bytes from {}", content.len(), url);
         
         // Parse the content
-        let mut ips = self.blocked_ips.write().unwrap();
-        let mut ranges = self.blocked_ranges.write().unwrap();
-        
         let mut url_ips = 0;
         let mut url_ranges = 0;
+        let mut new_ips = HashSet::new();
+        let mut new_ranges = Vec::new();
         
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
@@ -181,13 +192,13 @@ impl DNSBLServer {
             
             // Try to parse as CIDR
             if let Ok(network) = Ipv4Network::from_str(line) {
-                ranges.push(network);
+                new_ranges.push(network);
                 url_ranges += 1;
                 debug!("Added CIDR range from {}: {}", url, network);
             } 
             // Try as simple IP
             else if let Ok(ip) = Ipv4Addr::from_str(line) {
-                if ips.insert(ip) {
+                if new_ips.insert(ip) {
                     url_ips += 1;
                     debug!("Added IP from {}: {}", url, ip);
                 } else {
@@ -197,6 +208,19 @@ impl DNSBLServer {
                 warn!("Invalid line {} in {}: {}", line_num + 1, url, line);
             }
         }
+        
+        // Mettre à jour les structures partagées en une seule opération
+        {
+            let mut ips = self.blocked_ips.write().unwrap();
+            let mut ranges = self.blocked_ranges.write().unwrap();
+            
+            for ip in new_ips {
+                ips.insert(ip);
+            }
+            for range in new_ranges {
+                ranges.push(range);
+            }
+        } // Les verrous sont automatiquement relâchés ici
         
         Ok((url_ips, url_ranges))
     }
@@ -208,6 +232,7 @@ impl DNSBLServer {
         if ips.contains(&ip) {
             return true;
         }
+        // Le verrou est relâché automatiquement ici
         
         // Check CIDR ranges
         let ranges = self.blocked_ranges.read().unwrap();
@@ -216,6 +241,7 @@ impl DNSBLServer {
                 return true;
             }
         }
+        // Le verrou est relâché automatiquement ici
         
         false
     }
@@ -331,7 +357,10 @@ impl DNSBLServer {
             }
             
             let part = &query[pos + 1..pos + 1 + len];
-            domain_parts.push(String::from_utf8_lossy(part).to_string());
+            match String::from_utf8(part.to_vec()) {
+                Ok(part_str) => domain_parts.push(part_str),
+                Err(_) => return false,
+            }
             pos += len + 1;
             
             if pos >= query.len() {
@@ -397,11 +426,28 @@ impl DNSBLServer {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 53)
         };
         
-        let socket = UdpSocket::bind(socket_addr)?;
+        // Vérifier si le port est déjà utilisé
+        let socket = match UdpSocket::bind(socket_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to bind to {}: {}", socket_addr, e);
+                error!("Make sure the port is not already in use and you have the required permissions (root for port 53)");
+                return Err(e);
+            }
+        };
+        
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         
         info!("DNSBL server started on {} (domain: {})", socket_addr, self.domain);
         info!("Press Ctrl+C to stop the server");
+        
+        // Afficher quelques statistiques au démarrage
+        {
+            let ips = self.blocked_ips.read().unwrap();
+            let ranges = self.blocked_ranges.read().unwrap();
+            info!("Ready to serve with {} IPs and {} CIDR ranges in memory", 
+                  ips.len(), ranges.len());
+        }
         
         let mut buf = [0u8; 512];
         
@@ -431,7 +477,8 @@ impl DNSBLServer {
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // No data, continue
+                    // No data, continue - c'est normal avec le timeout
+                    continue;
                 }
                 Err(e) => {
                     warn!("Receive error: {}", e);
@@ -458,7 +505,16 @@ fn setup_logging(log_file: Option<&str>, verbose: bool) -> Result<(), fern::Init
             log::LevelFilter::Info
         });
     
+    // Ajouter le niveau Debug pour les modules spécifiques si verbose
+    if verbose {
+        dispatch = dispatch.level_for("dnsbl_server", log::LevelFilter::Debug);
+    }
+    
     if let Some(log_file) = log_file {
+        // Créer le répertoire parent si nécessaire
+        if let Some(parent) = Path::new(log_file).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         dispatch = dispatch.chain(fern::log_file(log_file)?);
     }
     
@@ -470,7 +526,7 @@ fn setup_logging(log_file: Option<&str>, verbose: bool) -> Result<(), fern::Init
 
 fn main() {
     let matches = App::new("DNSBL Server")
-        .version("1.0")
+        .version("1.2.0")
         .author("Philippe TEMESI")
         .about("A simple DNSBL server in Rust with support for local files and HTTP/HTTPS blocklists")
         .arg(
@@ -524,24 +580,7 @@ fn main() {
         .after_help("2026, Philippe TEMESI - https://www.tems.be\n\nExamples:\n  # Local files only\n  dnsbl-server -f blocklist.txt -f custom.txt\n\n  # HTTP/HTTPS URLs only\n  dnsbl-server -f http://www.spamhaus.org/drop/drop.txt -f https://rules.emergingthreats.net/fwrules/emerging-Block-IPs.txt\n\n  # Mixed local files and URLs\n  dnsbl-server -f blocklist.txt -f http://www.spamhaus.org/drop/drop.txt -f https://my-server.com/blocklist.txt\n\n  # With custom port\n  dnsbl-server -f blocklist.txt -f https://example.com/list.txt -i 127.0.0.1:5453 -v")
         .get_matches();
 
-    // Daemon mode
-    if matches.is_present("daemon") {
-        let daemonize = Daemonize::new()
-            .pid_file("/tmp/dnsbl.pid")
-            .chown_pid_file(true)
-            .working_directory(".")
-            .privileged_action(|| info!("Starting in daemon mode"));
-        
-        match daemonize.start() {
-            Ok(_) => info!("Daemon started successfully"),
-            Err(e) => {
-                eprintln!("Error starting daemon: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Setup logging
+    // Setup logging (avant le daemon pour voir les erreurs)
     let log_file = matches.value_of("log");
     let verbose = matches.is_present("verbose");
     
@@ -550,11 +589,35 @@ fn main() {
         std::process::exit(1);
     }
 
-    info!("DNSBL Server v1.0 - 2026, Philippe TEMESI");
+    info!("DNSBL Server v1.2.0 - 2026, Philippe TEMESI");
     info!("Website: https://www.tems.be");
+
+    // Daemon mode (après l'initialisation des logs)
+    if matches.is_present("daemon") {
+        info!("Starting in daemon mode...");
+        let daemonize = Daemonize::new()
+            .pid_file("/tmp/dnsbl.pid")
+            .chown_pid_file(true)
+            .working_directory(".")
+            .privileged_action(|| info!("Daemonized"));
+        
+        match daemonize.start() {
+            Ok(_) => info!("Daemon started successfully"),
+            Err(e) => {
+                error!("Error starting daemon: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
     
     // Get all source arguments
-    let sources: Vec<String> = matches.values_of_lossy("file").unwrap();
+    let sources: Vec<String> = match matches.values_of_lossy("file") {
+        Some(s) => s,
+        None => {
+            error!("No blocklist sources specified");
+            std::process::exit(1);
+        }
+    };
     
     info!("Loading {} blocklist source(s):", sources.len());
     for (i, source) in sources.iter().enumerate() {
@@ -570,10 +633,12 @@ fn main() {
     let dnsbl_server = DNSBLServer::new(domain);
     
     // Load blocklists from all sources
+    info!("Starting to load blocklists...");
     if let Err(e) = dnsbl_server.load_blocklists(&sources) {
         error!("Error loading blocklist source(s): {}", e);
         std::process::exit(1);
     }
+    info!("Blocklists loaded successfully");
     
     // Start server
     let interface = matches.value_of("interface").unwrap();
@@ -582,3 +647,4 @@ fn main() {
         std::process::exit(1);
     }
 }
+
