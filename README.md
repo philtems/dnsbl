@@ -25,7 +25,7 @@ A complete multi-zone DNSBL (DNS Blackhole List) server with NS/SOA record suppo
 
 ### Build
 
-git clone <your-repo>
+git clone "https://github.com/philtems/dnsbl.git"
 cd dnsbl
 cargo build --release
 
