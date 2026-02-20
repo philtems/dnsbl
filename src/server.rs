@@ -65,7 +65,7 @@ impl QueryLogger {
     }
 
     fn log_query(&self, src: SocketAddr, domain: &str, qtype: u16, 
-                 response_code: u8, response_ip: Option<Ipv4Addr>, source: Option<&str>) {
+                 response_code: u8, response_ip: Option<Ipv4Addr>, response_txt: Option<&str>, source: Option<&str>) {
         if !self.enabled {
             return;
         }
@@ -92,7 +92,7 @@ impl QueryLogger {
                     2 => "NS_RESPONSE".to_string(),
                     6 => "SOA_RESPONSE".to_string(),
                     15 => format!("MX_RESPONSE {}", response_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)),
-                    16 => "TXT_RESPONSE".to_string(),
+                    16 => format!("TXT_RESPONSE \"{}\"", response_txt.unwrap_or("")),
                     _ => "RESPONSE".to_string(),
                 }
             } else {
@@ -278,6 +278,19 @@ impl ZoneData {
 #[derive(Debug, Clone)]
 struct TxtRecord {
     text: String,
+}
+
+impl TxtRecord {
+    fn with_substitution(&self, ip: Ipv4Addr) -> String {
+        let octets = ip.octets();
+        let dotted = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        let reversed = format!("{}.{}.{}.{}", octets[3], octets[2], octets[1], octets[0]);
+        
+        self.text
+            .replace("@dotted", &dotted)
+            .replace("@reversed", &reversed)
+            .replace("@", &dotted)  // @ par défaut = format normal
+    }
 }
 
 // Structure pour les enregistrements MX
@@ -624,6 +637,32 @@ impl Zone {
         }
     }
 
+    fn extract_ip_from_domain(&self, domain: &str) -> Option<Ipv4Addr> {
+        let domain_lower = domain.to_lowercase();
+        let zone_domain_lower = self.domain_lowercase.to_lowercase();
+        
+        let ip_part = domain_lower.trim_end_matches(&format!(".{}", zone_domain_lower));
+        
+        let parts: Vec<&str> = ip_part.split('.').collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        
+        let last_four = &parts[parts.len() - 4..];
+        let octets: Result<Vec<u8>, _> = last_four
+            .iter()
+            .rev()
+            .map(|s| s.parse::<u8>())
+            .collect();
+        
+        let octets = match octets {
+            Ok(o) if o.len() == 4 => o,
+            _ => return None,
+        };
+        
+        Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
+    }
+
     fn is_blocked(&self, ip: Ipv4Addr) -> (bool, Option<String>) {
         {
             let data = self.data.read().unwrap();
@@ -646,6 +685,15 @@ impl Zone {
         
         debug!("[{}] IP {} not blocked", self.domain, ip);
         (false, None)
+    }
+
+    fn get_txt_for_ip(&self, ip: Ipv4Addr) -> Option<String> {
+        if self.txt_records.is_empty() {
+            return None;
+        }
+        
+        // Prendre le premier TXT record et faire la substitution
+        Some(self.txt_records[0].with_substitution(ip))
     }
 
     fn load_from_sources(&self) -> Result<ZoneData, String> {
@@ -746,7 +794,7 @@ impl Zone {
         
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent("DNSBL-Server/2.6 (https://www.tems.be)")
+            .user_agent("DNSBL-Server/2.7 (https://www.tems.be)")
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         
@@ -872,6 +920,7 @@ impl DNSBLServer {
                     src_addr, &domain, qtype_value, 
                     response_code, 
                     Some(self.find_zone(&domain).unwrap().self_ip),
+                    None,
                     None
                 );
             }
@@ -879,16 +928,16 @@ impl DNSBLServer {
             return response;
         }
         
-        if qtype_value == 1 {
-            let (result, source) = self.find_zone_and_check(&domain);
+        if qtype_value == 1 { // A record
+            let (result, source, ip) = self.find_zone_and_check_a(&domain);
             
             let mut response = Vec::new();
             response.extend_from_slice(id);
             
             match result {
-                Some((zone, ip)) => {
+                Some(zone) => {
                     info!("[{}] Blocked IP: {} (domain: {} from {})", 
-                          zone.domain, ip, domain, src_addr.ip());
+                          zone.domain, ip.unwrap(), domain, src_addr.ip());
                     
                     response.extend_from_slice(&[0x81, 0x80]);
                     response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
@@ -904,7 +953,7 @@ impl DNSBLServer {
                     
                     self.query_logger.log_query(
                         src_addr, &domain, qtype_value, 0, 
-                        Some(zone.response_ip), source.as_deref()
+                        Some(zone.response_ip), None, source.as_deref()
                     );
                     
                     Some(response)
@@ -919,7 +968,73 @@ impl DNSBLServer {
                     self.copy_question_section(query, &mut response)?;
                     
                     self.query_logger.log_query(
-                        src_addr, &domain, qtype_value, 3, None, None
+                        src_addr, &domain, qtype_value, 3, None, None, None
+                    );
+                    
+                    Some(response)
+                }
+            }
+        } else if qtype_value == 16 { // TXT record
+            let (result, source, ip, txt_opt) = self.find_zone_and_check_txt(&domain);
+            
+            let mut response = Vec::new();
+            response.extend_from_slice(id);
+            
+            match result {
+                Some(zone) => {
+                    info!("[{}] TXT query for IP: {} (domain: {} from {})", 
+                          zone.domain, ip.unwrap(), domain, src_addr.ip());
+                    
+                    if let Some(txt) = txt_opt {
+                        response.extend_from_slice(&[0x81, 0x80]);
+                        response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+                        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                        
+                        self.copy_question_section(query, &mut response)?;
+                        
+                        let txt_data = txt.as_bytes();
+                        let txt_len = 1 + txt_data.len();
+                        
+                        response.extend_from_slice(&[0xC0, 0x0C]);
+                        response.extend_from_slice(&[0x00, 0x10, 0x00, 0x01]);
+                        response.extend_from_slice(&TXT_RECORD_TTL.to_be_bytes());
+                        response.extend_from_slice(&(txt_len as u16).to_be_bytes());
+                        
+                        response.push(txt_data.len() as u8);
+                        response.extend_from_slice(txt_data);
+                        
+                        self.query_logger.log_query(
+                            src_addr, &domain, qtype_value, 0, 
+                            None, Some(&txt), source.as_deref()
+                        );
+                        
+                        Some(response)
+                    } else {
+                        // Pas de TXT record configuré
+                        response.extend_from_slice(&[0x81, 0x83]);
+                        response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+                        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                        
+                        self.copy_question_section(query, &mut response)?;
+                        
+                        self.query_logger.log_query(
+                            src_addr, &domain, qtype_value, 3, None, None, source.as_deref()
+                        );
+                        
+                        Some(response)
+                    }
+                }
+                None => {
+                    debug!("TXT not found (domain: {} from {})", domain, src_addr.ip());
+                    
+                    response.extend_from_slice(&[0x81, 0x83]);
+                    response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+                    response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    
+                    self.copy_question_section(query, &mut response)?;
+                    
+                    self.query_logger.log_query(
+                        src_addr, &domain, qtype_value, 3, None, None, None
                     );
                     
                     Some(response)
@@ -934,7 +1049,7 @@ impl DNSBLServer {
             self.copy_question_section(query, &mut response)?;
             
             self.query_logger.log_query(
-                src_addr, &domain, qtype_value, 4, None, None
+                src_addr, &domain, qtype_value, 4, None, None, None
             );
             
             Some(response)
@@ -1073,7 +1188,7 @@ impl DNSBLServer {
                 (Some(response), 0)
             }
             
-            16 => { // TXT record
+            16 => { // TXT record for the domain itself
                 if zone.txt_records.is_empty() {
                     return (None, 4);
                 }
@@ -1086,6 +1201,7 @@ impl DNSBLServer {
                     return (None, 2);
                 }
                 
+                // Pour le domaine lui-même, pas de substitution d'IP
                 let txt = &zone.txt_records[0];
                 let txt_data = txt.text.as_bytes();
                 let txt_len = 1 + txt_data.len();
@@ -1206,41 +1322,42 @@ impl DNSBLServer {
         }
     }
     
-    fn find_zone_and_check(&self, domain: &str) -> (Option<(&Zone, Ipv4Addr)>, Option<String>) {
+    fn find_zone_and_check_a(&self, domain: &str) -> (Option<&Zone>, Option<String>, Option<Ipv4Addr>) {
         let zone = match self.find_zone(domain) {
             Some(z) => z,
-            None => return (None, None),
+            None => return (None, None, None),
         };
         
-        let domain_lower = domain.to_lowercase();
-        let zone_domain_lower = zone.domain_lowercase.to_lowercase();
-        
-        let ip_part = domain_lower.trim_end_matches(&format!(".{}", zone_domain_lower));
-        
-        let parts: Vec<&str> = ip_part.split('.').collect();
-        if parts.len() < 4 {
-            return (None, None);
-        }
-        
-        let last_four = &parts[parts.len() - 4..];
-        let octets: Result<Vec<u8>, _> = last_four
-            .iter()
-            .rev()
-            .map(|s| s.parse::<u8>())
-            .collect();
-        
-        let octets = match octets {
-            Ok(o) if o.len() == 4 => o,
-            _ => return (None, None),
+        let ip = match zone.extract_ip_from_domain(domain) {
+            Some(ip) => ip,
+            None => return (None, None, None),
         };
-        
-        let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
         
         let (blocked, source) = zone.is_blocked(ip);
         if blocked {
-            (Some((zone, ip)), source)
+            (Some(zone), source, Some(ip))
         } else {
-            (None, None)
+            (None, None, None)
+        }
+    }
+    
+    fn find_zone_and_check_txt(&self, domain: &str) -> (Option<&Zone>, Option<String>, Option<Ipv4Addr>, Option<String>) {
+        let zone = match self.find_zone(domain) {
+            Some(z) => z,
+            None => return (None, None, None, None),
+        };
+        
+        let ip = match zone.extract_ip_from_domain(domain) {
+            Some(ip) => ip,
+            None => return (None, None, None, None),
+        };
+        
+        let (blocked, source) = zone.is_blocked(ip);
+        if blocked {
+            let txt = zone.get_txt_for_ip(ip);
+            (Some(zone), source, Some(ip), txt)
+        } else {
+            (None, None, None, None)
         }
     }
 
@@ -1256,8 +1373,9 @@ impl DNSBLServer {
         let socket = UdpSocket::bind(socket_addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         
-        info!("DNSBL server v2.6.0 started on {}", socket_addr);
+        info!("DNSBL server v2.7.0 started on {}", socket_addr);
         info!("Self-domain A/NS/SOA/MX/TXT record support enabled (case-insensitive)");
+        info!("TXT record IP substitution enabled (@, @dotted, @reversed)");
         info!("Real-time DNSBL forwarding support enabled with NS discovery (trust-dns)");
         
         if self.query_logger.enabled {
@@ -1414,7 +1532,7 @@ fn read_source_file(filename: &str) -> io::Result<Vec<String>> {
 fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, u64, 
                           RateLimiterConfig, Option<String>, Option<String>), String> {
     let matches = App::new("DNSBL Server")
-        .version("2.6.0")
+        .version("2.7.0")
         .author("Philippe TEMESI")
         .about("A multi-zone DNSBL server with NS/SOA/MX/TXT record support and real-time DNSBL forwarding")
         .arg(
@@ -1448,7 +1566,7 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
             Arg::with_name("txt")
                 .long("txt")
                 .value_name("TEXT")
-                .help("TXT record for the domain (can be multiple)")
+                .help("TXT record for the domain (supports @, @dotted, @reversed substitution)")
                 .takes_value(true)
                 .multiple(true)
         )
@@ -1747,8 +1865,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    info!("DNSBL Server v2.6.0 - 2026, Philippe TEMESI");
+    info!("DNSBL Server v2.7.0 - 2026, Philippe TEMESI");
     info!("Self-domain A/NS/SOA/MX/TXT record support enabled (case-insensitive)");
+    info!("TXT record IP substitution enabled (@, @dotted, @reversed)");
     info!("Real-time DNSBL forwarding support enabled with NS discovery (trust-dns)");
 
     if daemon_mode {
