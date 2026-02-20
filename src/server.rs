@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::thread;
 
@@ -14,6 +14,90 @@ use ipnetwork::{Ipv4Network, IpNetwork};
 use log::{info, warn, error, debug};
 use reqwest::blocking::Client;
 use url::Url;
+use rand::RngCore;
+
+use trust_dns_proto::op::{Message, MessageType, Query, ResponseCode};
+use trust_dns_proto::rr::{RecordType, Name, RData};
+use trust_dns_proto::serialize::binary::{BinEncoder, BinDecoder, BinEncodable, BinDecodable};
+use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+use trust_dns_resolver::Resolver;
+
+// Constantes DNS
+const NS_RECORD_TTL: u32 = 86400;        // 24 heures pour les NS records
+const A_RECORD_TTL: u32 = 300;           // 5 minutes pour les A records
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Types de sources
+#[derive(Debug, Clone)]
+enum SourceType {
+    Http(String),      // http:// ou https://
+    File(String),      // fichier local
+    Dnsbl(String),     // dnsbl://domaine (requêtes en temps réel)
+}
+
+// Structure pour le logging des requêtes
+#[derive(Clone)]
+struct QueryLogger {
+    enabled: bool,
+    file: Option<Arc<RwLock<File>>>,
+}
+
+impl QueryLogger {
+    fn new(filename: Option<String>) -> io::Result<Self> {
+        match filename {
+            Some(path) => {
+                if let Some(parent) = Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let file = File::create(path)?;
+                Ok(QueryLogger {
+                    enabled: true,
+                    file: Some(Arc::new(RwLock::new(file))),
+                })
+            }
+            None => Ok(QueryLogger {
+                enabled: false,
+                file: None,
+            }),
+        }
+    }
+
+    fn log_query(&self, src: SocketAddr, domain: &str, qtype: u16, blocked: bool, response_ip: Option<Ipv4Addr>) {
+        if !self.enabled {
+            return;
+        }
+
+        if let Some(file_lock) = &self.file {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let qtype_str = match qtype {
+                1 => "A",
+                2 => "NS",
+                5 => "CNAME",
+                6 => "SOA",
+                12 => "PTR",
+                15 => "MX",
+                16 => "TXT",
+                28 => "AAAA",
+                255 => "ANY",
+                _ => "UNKNOWN",
+            };
+            
+            let status = if blocked {
+                format!("BLOCKED {}", response_ip.unwrap_or(Ipv4Addr::UNSPECIFIED))
+            } else {
+                "NOT_BLOCKED".to_string()
+            };
+            
+            let log_line = format!("[{}] {} {} {} {}\n", 
+                timestamp, src.ip(), domain, qtype_str, status);
+            
+            if let Ok(mut file) = file_lock.write() {
+                let _ = file.write_all(log_line.as_bytes());
+                let _ = file.flush();
+            }
+        }
+    }
+}
 
 // Structure pour le rate limiting
 #[derive(Debug, Clone)]
@@ -128,19 +212,53 @@ impl ZoneData {
     }
 }
 
+// Structure pour les serveurs DNS d'un DNSBL distant
+#[derive(Debug, Clone)]
+struct DnsblServerInfo {
+    name_servers: Vec<Ipv4Addr>,
+    last_update: Instant,
+    current_index: usize, // Pour la rotation round-robin
+}
+
+impl DnsblServerInfo {
+    fn new() -> Self {
+        DnsblServerInfo {
+            name_servers: Vec::new(),
+            last_update: Instant::now(),
+            current_index: 0,
+        }
+    }
+
+    fn needs_update(&self) -> bool {
+        self.name_servers.is_empty() || self.last_update.elapsed() > Duration::from_secs(3600) // 1 heure
+    }
+
+    fn get_next_server(&mut self) -> Option<Ipv4Addr> {
+        if self.name_servers.is_empty() {
+            return None;
+        }
+        
+        let server = self.name_servers[self.current_index];
+        self.current_index = (self.current_index + 1) % self.name_servers.len();
+        Some(server)
+    }
+}
+
 // Structure pour une zone DNSBL
 #[derive(Debug, Clone)]
 struct Zone {
     domain: String,
     domain_lowercase: String,  // Version en minuscules pour la comparaison
     response_ip: Ipv4Addr,
-    self_ip: Ipv4Addr,  // IP pour les requêtes A sur le domaine lui-même
-    sources: Vec<String>,
+    self_ip: Ipv4Addr,  // IP pour les requêtes A/NS sur le domaine lui-même
+    sources: Vec<SourceType>,
     data: Arc<RwLock<ZoneData>>,
+    dnsbl_forwarders: Arc<RwLock<HashMap<String, (Ipv4Addr, Instant)>>>, // Cache pour dnsbl:// avec timestamp
+    dnsbl_servers: Arc<RwLock<HashMap<String, DnsblServerInfo>>>, // Cache des serveurs DNSBL distants
 }
 
 impl Zone {
-    fn new(domain: &str, response_ip: Ipv4Addr, self_ip: Ipv4Addr, sources: Vec<String>) -> Self {
+    fn new(domain: &str, response_ip: Ipv4Addr, self_ip: Ipv4Addr, sources: Vec<SourceType>) -> Self {
         Zone {
             domain: domain.to_string(),
             domain_lowercase: domain.to_lowercase(),
@@ -148,12 +266,334 @@ impl Zone {
             self_ip,
             sources,
             data: Arc::new(RwLock::new(ZoneData::new())),
+            dnsbl_forwarders: Arc::new(RwLock::new(HashMap::new())),
+            dnsbl_servers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    // Découvrir les serveurs NS d'un domaine en utilisant trust-dns
+    fn discover_ns_servers(&self, domain: &str) -> io::Result<Vec<Ipv4Addr>> {
+        debug!("[{}] Discovering NS records for {} using trust-dns", self.domain, domain);
+        
+        let mut ns_servers = Vec::new();
+        let mut ns_names = Vec::new();
+        
+        // Créer un résolveur avec la configuration par défaut
+        let resolver = match Resolver::new(ResolverConfig::default(), ResolverOpts::default()) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Failed to create resolver: {}", e);
+                return Err(io::Error::new(io::ErrorKind::Other, "Failed to create resolver"));
+            }
+        };
+        
+        // Étape 1: Récupérer les enregistrements NS
+        match resolver.ns_lookup(domain) {
+            Ok(lookup) => {
+                for ns in lookup.iter() {
+                    // lookup.iter() retourne directement des &NS
+                    let ns_name = ns.0.to_string();
+                    // Enlever le point final si présent
+                    let ns_name = ns_name.trim_end_matches('.').to_string();
+                    debug!("Found NS: {}", ns_name);
+                    ns_names.push(ns_name);
+                }
+            }
+            Err(e) => {
+                debug!("NS lookup failed for {}: {}", domain, e);
+                return Err(io::Error::new(io::ErrorKind::Other, format!("NS lookup failed: {}", e)));
+            }
+        }
+        
+        if ns_names.is_empty() {
+            debug!("No NS records found");
+            return Err(io::Error::new(io::ErrorKind::Other, "No NS records found"));
+        }
+        
+        // Étape 2: Résoudre chaque nom NS en IP
+        for ns_name in ns_names {
+            debug!("Resolving NS name: {}", ns_name);
+            
+            // Essayer de résoudre le nom via les résolveurs publics
+            match resolver.ipv4_lookup(&ns_name) {
+                Ok(lookup) => {
+                    for a in lookup.iter() {
+                        // lookup.iter() retourne directement des &A
+                        let ip_addr = a.0;
+                        debug!("Resolved {} to {}", ns_name, ip_addr);
+                        ns_servers.push(ip_addr);
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to resolve {}: {}", ns_name, e);
+                }
+            }
+        }
+        
+        // Dédupliquer (les Ipv4Addr implémentent Ord)
+        ns_servers.sort();
+        ns_servers.dedup();
+        
+        if ns_servers.is_empty() {
+            debug!("No NS IPs found after resolution");
+            Err(io::Error::new(io::ErrorKind::Other, "No NS IPs found"))
+        } else {
+            info!("[{}] Found {} NS servers for {}", self.domain, ns_servers.len(), domain);
+            debug!("NS servers: {:?}", ns_servers);
+            Ok(ns_servers)
+        }
+    }
+
+    // Obtenir un serveur DNS pour un domaine DNSBL distant
+    fn get_dnsbl_server(&self, dnsbl_domain: &str) -> Option<Ipv4Addr> {
+        let mut servers = self.dnsbl_servers.write().unwrap();
+        
+        // Vérifier si on a déjà des serveurs pour ce domaine
+        let server_info = servers.entry(dnsbl_domain.to_string())
+            .or_insert_with(DnsblServerInfo::new);
+        
+        // Mettre à jour si nécessaire
+        if server_info.needs_update() {
+            debug!("[{}] Discovering NS records for DNSBL: {}", self.domain, dnsbl_domain);
+            match self.discover_ns_servers(dnsbl_domain) {
+                Ok(ns_servers) if !ns_servers.is_empty() => {
+                    info!("[{}] Found {} NS servers for {}", self.domain, ns_servers.len(), dnsbl_domain);
+                    server_info.name_servers = ns_servers;
+                    server_info.last_update = Instant::now();
+                    server_info.current_index = 0;
+                }
+                _ => {
+                    warn!("[{}] Failed to discover NS servers for {}, will use fallback", 
+                          self.domain, dnsbl_domain);
+                    // Fallback sur les résolveurs publics
+                    server_info.name_servers = vec![
+                        Ipv4Addr::new(8,8,8,8),
+                        Ipv4Addr::new(1,1,1,1),
+                        Ipv4Addr::new(9,9,9,9),
+                    ];
+                }
+            }
+        }
+        
+        server_info.get_next_server()
+    }
+
+    // Méthode pour vérifier une IP via un DNSBL distant
+    fn check_dnsbl(&self, dnsbl_domain: &str, ip: Ipv4Addr) -> bool {
+        // Construire le domaine de requête (IP inversée + domaine)
+        let octets = ip.octets();
+        let query_domain = format!("{}.{}.{}.{}.{}",
+            octets[3], octets[2], octets[1], octets[0],
+            dnsbl_domain);
+        
+        debug!("[{}] Checking DNSBL {} for IP {} -> {}", 
+               self.domain, dnsbl_domain, ip, query_domain);
+        
+        let now = Instant::now();
+        
+        // Vérifier le cache (avec expiration de 5 minutes)
+        {
+            let mut cache = self.dnsbl_forwarders.write().unwrap();
+            
+            // Nettoyer le cache expiré
+            cache.retain(|_, (_, timestamp)| now.duration_since(*timestamp) < Duration::from_secs(300));
+            
+            if let Some(&(result, _)) = cache.get(&query_domain) {
+                debug!("[{}] Cache hit for {}: {}", self.domain, query_domain, result);
+                return result != Ipv4Addr::UNSPECIFIED;
+            }
+        }
+        
+        // Obtenir un serveur DNS pour ce DNSBL
+        if let Some(dns_server) = self.get_dnsbl_server(dnsbl_domain) {
+            debug!("[{}] Using DNS server {} for {}", self.domain, dns_server, dnsbl_domain);
+            
+            // Requête DNS en temps réel vers le serveur autoritatif
+            match self.resolve_dnsbl_query_with_server(&query_domain, dns_server) {
+                Some(ip_result) if ip_result != Ipv4Addr::UNSPECIFIED => {
+                    debug!("[{}] DNSBL returned: {} for {}", self.domain, ip_result, query_domain);
+                    // Mettre en cache
+                    let mut cache = self.dnsbl_forwarders.write().unwrap();
+                    cache.insert(query_domain, (ip_result, now));
+                    true
+                }
+                Some(_) => {
+                    debug!("[{}] DNSBL returned NXDOMAIN for {}", self.domain, query_domain);
+                    // Cacher aussi les NXDOMAIN pour éviter de re-vérifier trop souvent
+                    let mut cache = self.dnsbl_forwarders.write().unwrap();
+                    cache.insert(query_domain, (Ipv4Addr::UNSPECIFIED, now));
+                    false
+                }
+                None => {
+                    debug!("[{}] DNSBL query failed for {}", self.domain, query_domain);
+                    false
+                }
+            }
+        } else {
+            // Fallback sur les résolveurs publics
+            debug!("[{}] No specific DNS server, using fallback for {}", self.domain, query_domain);
+            match self.resolve_dnsbl_query_fallback(&query_domain) {
+                Some(ip_result) if ip_result != Ipv4Addr::UNSPECIFIED => {
+                    let mut cache = self.dnsbl_forwarders.write().unwrap();
+                    cache.insert(query_domain, (ip_result, now));
+                    true
+                }
+                _ => false
+            }
+        }
+    }
+
+    // Résoudre une requête DNSBL avec un serveur spécifique (trust-dns)
+    fn resolve_dnsbl_query_with_server(&self, query_domain: &str, dns_server: Ipv4Addr) -> Option<Ipv4Addr> {
+        use std::net::UdpSocket;
+        
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Failed to bind socket: {}", e);
+                return None;
+            }
+        };
+        
+        if let Err(e) = socket.set_read_timeout(Some(DNS_QUERY_TIMEOUT)) {
+            debug!("Failed to set timeout: {}", e);
+            return None;
+        }
+        
+        let server_addr = SocketAddr::new(IpAddr::V4(dns_server), 53);
+        
+        // Construire la requête DNS avec trust-dns
+        let mut msg = Message::new();
+        let id = rand::thread_rng().next_u32() as u16;
+        msg.set_id(id);
+        msg.set_message_type(MessageType::Query);
+        msg.set_recursion_desired(false); // Important : pas de récursion pour les requêtes autoritatives
+        
+        // Ajouter la question
+        if let Ok(name) = Name::from_utf8(query_domain) {
+            let query = Query::query(name, RecordType::A);
+            msg.add_query(query);
+        } else {
+            debug!("Invalid domain name: {}", query_domain);
+            return None;
+        }
+        
+        // Encoder le message
+        let mut buf = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut buf);
+            if msg.emit(&mut encoder).is_err() {
+                debug!("Failed to encode DNS query");
+                return None;
+            }
+        }
+        
+        debug!("Sending DNS query to {}:{}: {} bytes", dns_server, 53, buf.len());
+        
+        if let Err(e) = socket.send_to(&buf, server_addr) {
+            debug!("Send error: {}", e);
+            return None;
+        }
+        
+        let mut recv_buf = [0u8; 512];
+        match socket.recv_from(&mut recv_buf) {
+            Ok((size, _)) => {
+                // Décoder la réponse
+                let mut decoder = BinDecoder::new(&recv_buf[..size]);
+                match Message::read(&mut decoder) {
+                    Ok(response) => {
+                        if response.id() != id {
+                            debug!("ID mismatch");
+                            return None;
+                        }
+                        
+                        if response.response_code() != ResponseCode::NoError {
+                            if response.response_code() == ResponseCode::NXDomain {
+                                debug!("DNSBL returned NXDOMAIN");
+                                return Some(Ipv4Addr::UNSPECIFIED);
+                            }
+                            debug!("DNS error: {:?}", response.response_code());
+                            return None;
+                        }
+                        
+                        // Chercher les réponses A
+                        for answer in response.answers() {
+                            if let Some(rdata) = answer.data() {
+                                if let RData::A(ip) = rdata {
+                                    let ip_addr = ip.0;
+                                    debug!("DNSBL returned: {}", ip_addr);
+                                    return Some(ip_addr);
+                                }
+                            }
+                        }
+                        
+                        debug!("No A records in response");
+                        None
+                    }
+                    Err(e) => {
+                        debug!("Failed to decode response: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Receive error: {}", e);
+                None
+            }
+        }
+    }
+
+    // Fallback avec les résolveurs publics
+    fn resolve_dnsbl_query_fallback(&self, query_domain: &str) -> Option<Ipv4Addr> {
+        let resolver = match Resolver::new(ResolverConfig::default(), ResolverOpts::default()) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Failed to create resolver: {}", e);
+                return None;
+            }
+        };
+        
+        match resolver.ipv4_lookup(query_domain) {
+            Ok(lookup) => {
+                for a in lookup.iter() {
+                    // lookup.iter() retourne directement des &A
+                    let ip_addr = a.0;
+                    debug!("Fallback resolver returned: {}", ip_addr);
+                    return Some(ip_addr);
+                }
+                None
+            }
+            Err(e) => {
+                debug!("Fallback resolver failed: {}", e);
+                None
+            }
         }
     }
 
     fn is_blocked(&self, ip: Ipv4Addr) -> bool {
-        let data = self.data.read().unwrap();
-        data.is_blocked(ip)
+        // D'abord vérifier les données locales
+        {
+            let data = self.data.read().unwrap();
+            if data.is_blocked(ip) {
+                debug!("[{}] IP {} blocked by local data", self.domain, ip);
+                return true;
+            }
+        }
+        
+        // Ensuite vérifier les sources DNSBL en temps réel
+        for source in &self.sources {
+            if let SourceType::Dnsbl(dnsbl_domain) = source {
+                debug!("[{}] Checking DNSBL {} for IP {}", self.domain, dnsbl_domain, ip);
+                let blocked = self.check_dnsbl(dnsbl_domain, ip);
+                if blocked {
+                    debug!("[{}] IP {} blocked by DNSBL {}", self.domain, ip, dnsbl_domain);
+                    return true;
+                }
+            }
+        }
+        
+        debug!("[{}] IP {} not blocked", self.domain, ip);
+        false
     }
 
     fn load_from_sources(&self) -> Result<ZoneData, String> {
@@ -162,31 +602,38 @@ impl Zone {
         let mut total_ranges = 0;
         
         for source in &self.sources {
-            if source.starts_with("http://") || source.starts_with("https://") {
-                match self.load_from_url(source, &mut new_data) {
-                    Ok((url_ips, url_ranges)) => {
-                        total_ips += url_ips;
-                        total_ranges += url_ranges;
-                        info!("[{}] Loaded {} IPs and {} CIDR ranges from URL: {}", 
-                              self.domain, url_ips, url_ranges, source);
-                    }
-                    Err(e) => {
-                        error!("[{}] Error loading from URL {}: {}", self.domain, source, e);
-                        return Err(format!("Failed to load {}: {}", source, e));
+            match source {
+                SourceType::Http(url) => {
+                    match self.load_from_url(url, &mut new_data) {
+                        Ok((url_ips, url_ranges)) => {
+                            total_ips += url_ips;
+                            total_ranges += url_ranges;
+                            info!("[{}] Loaded {} IPs and {} CIDR ranges from URL: {}", 
+                                  self.domain, url_ips, url_ranges, url);
+                        }
+                        Err(e) => {
+                            error!("[{}] Error loading from URL {}: {}", self.domain, url, e);
+                            return Err(format!("Failed to load {}: {}", url, e));
+                        }
                     }
                 }
-            } else {
-                match self.load_from_file(source, &mut new_data) {
-                    Ok((file_ips, file_ranges)) => {
-                        total_ips += file_ips;
-                        total_ranges += file_ranges;
-                        info!("[{}] Loaded {} IPs and {} CIDR ranges from file: {}", 
-                              self.domain, file_ips, file_ranges, source);
+                SourceType::File(filename) => {
+                    match self.load_from_file(filename, &mut new_data) {
+                        Ok((file_ips, file_ranges)) => {
+                            total_ips += file_ips;
+                            total_ranges += file_ranges;
+                            info!("[{}] Loaded {} IPs and {} CIDR ranges from file: {}", 
+                                  self.domain, file_ips, file_ranges, filename);
+                        }
+                        Err(e) => {
+                            error!("[{}] Error loading from file {}: {}", self.domain, filename, e);
+                            return Err(format!("Failed to load {}: {}", filename, e));
+                        }
                     }
-                    Err(e) => {
-                        error!("[{}] Error loading from file {}: {}", self.domain, source, e);
-                        return Err(format!("Failed to load {}: {}", source, e));
-                    }
+                }
+                SourceType::Dnsbl(domain) => {
+                    // Les DNSBL sont vérifiés en temps réel, pas chargés
+                    info!("[{}] Registered DNSBL forwarder: {}", self.domain, domain);
                 }
             }
         }
@@ -248,7 +695,7 @@ impl Zone {
         
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent("DNSBL-Server/2.0 (https://www.tems.be)")
+            .user_agent("DNSBL-Server/2.5 (https://www.tems.be)")
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         
@@ -304,18 +751,11 @@ struct DNSBLServer {
     zones: Arc<HashMap<String, Zone>>,
     zones_by_lowercase: Arc<HashMap<String, String>>, // Mapping lowercase -> original domain
     rate_limiter: Arc<RateLimiter>,
+    query_logger: Arc<QueryLogger>,
 }
 
 impl DNSBLServer {
-    fn new() -> Self {
-        DNSBLServer {
-            zones: Arc::new(HashMap::new()),
-            zones_by_lowercase: Arc::new(HashMap::new()),
-            rate_limiter: Arc::new(RateLimiter::new(0, Vec::new())),
-        }
-    }
-
-    fn with_zones_and_limiter(zones: HashMap<String, Zone>, rate_limiter: RateLimiter) -> Self {
+    fn with_zones_and_limiter(zones: HashMap<String, Zone>, rate_limiter: RateLimiter, query_logger: QueryLogger) -> Self {
         let mut zones_by_lowercase = HashMap::new();
         for (domain, zone) in &zones {
             zones_by_lowercase.insert(zone.domain_lowercase.clone(), domain.clone());
@@ -325,6 +765,7 @@ impl DNSBLServer {
             zones: Arc::new(zones),
             zones_by_lowercase: Arc::new(zones_by_lowercase),
             rate_limiter: Arc::new(rate_limiter),
+            query_logger: Arc::new(query_logger),
         }
     }
 
@@ -359,7 +800,7 @@ impl DNSBLServer {
 
         let id = &query[0..2];
         
-        let (domain, parse_success) = self.parse_query_domain(query);
+        let (domain, parse_success, qtype_bytes) = self.parse_query_domain_with_type(query);
         
         if !parse_success {
             return None;
@@ -370,49 +811,81 @@ impl DNSBLServer {
             None => return None,
         };
         
-        debug!("Query received for domain: {} from {}", domain, src_addr);
-        
-        // Vérifier si c'est une requête pour le domaine lui-même (case-insensitive)
+        let qtype_value = u16::from_be_bytes([qtype_bytes[0], qtype_bytes[1]]);
+        debug!("Query received for domain: {} (type: {}) from {}", 
+               domain, self.qtype_to_string(&qtype_bytes), src_addr);
+
+        // Vérifier si c'est une requête pour le domaine lui-même
         if self.is_self_domain_query(&domain) {
-            return self.handle_self_domain_query(id, query, &domain);
+            let response = self.handle_self_domain_query(id, query, &domain, &qtype_bytes);
+            
+            // Logguer la requête
+            if let Some(ref resp) = response {
+                // Vérifier si c'est une réponse positive
+                if resp.len() > 4 && (resp[3] & 0x0F) == 0 {
+                    self.query_logger.log_query(src_addr, &domain, qtype_value, true, Some(self.find_zone(&domain).unwrap().self_ip));
+                } else {
+                    self.query_logger.log_query(src_addr, &domain, qtype_value, false, None);
+                }
+            }
+            
+            return response;
         }
         
-        // Sinon, traiter comme une requête DNSBL normale
-        let result = self.find_zone_and_check(&domain);
-        
-        let mut response = Vec::new();
-        response.extend_from_slice(id);
-        
-        match result {
-            Some((zone, ip)) => {
-                info!("[{}] Blocked IP: {} (domain: {} from {})", 
-                      zone.domain, ip, domain, src_addr.ip());
-                
-                response.extend_from_slice(&[0x81, 0x80]);
-                response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-                response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                
-                self.copy_question_section(query, &mut response)?;
-                
-                response.extend_from_slice(&[0xC0, 0x0C]);
-                response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-                response.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]);
-                response.extend_from_slice(&[0x00, 0x04]);
-                response.extend_from_slice(&zone.response_ip.octets());
-                
-                Some(response)
+        // Pour les requêtes DNSBL, on ne traite que les A records (type 1)
+        if qtype_value == 1 { // A record
+            let result = self.find_zone_and_check(&domain);
+            
+            let mut response = Vec::new();
+            response.extend_from_slice(id);
+            
+            match result {
+                Some((zone, ip)) => {
+                    info!("[{}] Blocked IP: {} (domain: {} from {})", 
+                          zone.domain, ip, domain, src_addr.ip());
+                    
+                    response.extend_from_slice(&[0x81, 0x80]); // Standard query response, No error
+                    response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+                    response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    
+                    self.copy_question_section(query, &mut response)?;
+                    
+                    response.extend_from_slice(&[0xC0, 0x0C]);
+                    response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+                    response.extend_from_slice(&A_RECORD_TTL.to_be_bytes());
+                    response.extend_from_slice(&[0x00, 0x04]);
+                    response.extend_from_slice(&zone.response_ip.octets());
+                    
+                    self.query_logger.log_query(src_addr, &domain, qtype_value, true, Some(zone.response_ip));
+                    
+                    Some(response)
+                }
+                None => {
+                    debug!("IP not blocked (domain: {} from {})", domain, src_addr.ip());
+                    
+                    response.extend_from_slice(&[0x81, 0x83]); // NXDOMAIN
+                    response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+                    response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    
+                    self.copy_question_section(query, &mut response)?;
+                    
+                    self.query_logger.log_query(src_addr, &domain, qtype_value, false, None);
+                    
+                    Some(response)
+                }
             }
-            None => {
-                debug!("IP not blocked (domain: {} from {})", domain, src_addr.ip());
-                
-                response.extend_from_slice(&[0x81, 0x83]);
-                response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
-                response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                
-                self.copy_question_section(query, &mut response)?;
-                
-                Some(response)
-            }
+        } else {
+            // Autres types de requêtes (non supportés)
+            let mut response = Vec::new();
+            response.extend_from_slice(id);
+            response.extend_from_slice(&[0x81, 0x04]); // Not implemented
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+            response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            self.copy_question_section(query, &mut response)?;
+            
+            self.query_logger.log_query(src_addr, &domain, qtype_value, false, None);
+            
+            Some(response)
         }
     }
     
@@ -427,34 +900,102 @@ impl DNSBLServer {
         false
     }
     
-    fn handle_self_domain_query(&self, id: &[u8], query: &[u8], domain: &str) -> Option<Vec<u8>> {
-        // Trouver la zone correspondante (case-insensitive)
+    fn handle_self_domain_query(&self, id: &[u8], query: &[u8], domain: &str, qtype: &[u8]) -> Option<Vec<u8>> {
         let zone = self.find_zone(domain)?;
+        let qtype_value = u16::from_be_bytes([qtype[0], qtype[1]]);
         
-        info!("Self-domain query for: {} -> {} from {}", 
-              domain, zone.self_ip, "?"); // L'IP source sera ajoutée dans handle_query
+        info!("Self-domain query for: {} (type: {})", 
+              domain, self.qtype_to_string(qtype));
         
         let mut response = Vec::new();
         response.extend_from_slice(id);
         
-        response.extend_from_slice(&[0x81, 0x80]);
-        response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        
-        self.copy_question_section(query, &mut response)?;
-        
-        response.extend_from_slice(&[0xC0, 0x0C]);
-        response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-        response.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]);
-        response.extend_from_slice(&[0x00, 0x04]);
-        response.extend_from_slice(&zone.self_ip.octets());
+        // A record
+        if qtype_value == 1 {
+            response.extend_from_slice(&[0x81, 0x80]);
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            
+            self.copy_question_section(query, &mut response)?;
+            
+            response.extend_from_slice(&[0xC0, 0x0C]);
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            response.extend_from_slice(&A_RECORD_TTL.to_be_bytes());
+            response.extend_from_slice(&[0x00, 0x04]);
+            response.extend_from_slice(&zone.self_ip.octets());
+            
+        // NS record
+        } else if qtype_value == 2 {
+            response.extend_from_slice(&[0x81, 0x80]);
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x02]); // 2 réponses: NS + A (glue)
+            response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            
+            self.copy_question_section(query, &mut response)?;
+            
+            // Première réponse: NS record
+            response.extend_from_slice(&[0xC0, 0x0C]); // Compression pointer vers le nom de la question
+            
+            response.extend_from_slice(&[0x00, 0x02, 0x00, 0x01]); // Type NS, class IN
+            response.extend_from_slice(&NS_RECORD_TTL.to_be_bytes());
+            
+            // Nom du serveur de noms (le même que le domaine)
+            let ns_name = self.domain_to_labels(domain);
+            let ns_name_len = ns_name.len() as u16;
+            response.extend_from_slice(&ns_name_len.to_be_bytes());
+            response.extend_from_slice(&ns_name);
+            
+            // Deuxième réponse: A record (glue) pour le serveur de noms
+            response.extend_from_slice(&[0xC0, 0x0C]); // Compression pointer vers le même nom
+            
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // Type A, class IN
+            response.extend_from_slice(&A_RECORD_TTL.to_be_bytes());
+            response.extend_from_slice(&[0x00, 0x04]); // Longueur IPv4
+            response.extend_from_slice(&zone.self_ip.octets());
+            
+        // SOA record (utile pour certaines vérifications)
+        } else if qtype_value == 6 {
+            response.extend_from_slice(&[0x81, 0x80]);
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            
+            self.copy_question_section(query, &mut response)?;
+            
+            response.extend_from_slice(&[0xC0, 0x0C]); // Compression pointer
+            
+            response.extend_from_slice(&[0x00, 0x06, 0x00, 0x01]); // Type SOA, class IN
+            response.extend_from_slice(&NS_RECORD_TTL.to_be_bytes());
+            
+            // SOA record data (MNAME, RNAME, etc.)
+            let mname = self.domain_to_labels(domain); // Primary NS
+            let rname = self.domain_to_labels(&format!("hostmaster.{}", domain)); // Responsible email
+            
+            let soa_len = mname.len() + rname.len() + 20; // 20 bytes for serial, refresh, etc.
+            response.extend_from_slice(&(soa_len as u16).to_be_bytes());
+            
+            response.extend_from_slice(&mname);
+            response.extend_from_slice(&rname);
+            
+            // Serial, refresh, retry, expire, minimum
+            response.extend_from_slice(&1u32.to_be_bytes()); // Serial
+            response.extend_from_slice(&7200u32.to_be_bytes()); // Refresh (2 hours)
+            response.extend_from_slice(&3600u32.to_be_bytes()); // Retry (1 hour)
+            response.extend_from_slice(&86400u32.to_be_bytes()); // Expire (1 day)
+            response.extend_from_slice(&300u32.to_be_bytes()); // Minimum TTL (5 min)
+            
+        } else {
+            // Autres types : retourner une réponse vide avec le code "Not implemented"
+            response.extend_from_slice(&[0x81, 0x04]);
+            response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+            response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            self.copy_question_section(query, &mut response)?;
+        }
         
         Some(response)
     }
     
-    fn parse_query_domain(&self, query: &[u8]) -> (Option<String>, bool) {
+    fn parse_query_domain_with_type(&self, query: &[u8]) -> (Option<String>, bool, [u8; 2]) {
         if query.len() < 12 {
-            return (None, false);
+            return (None, false, [0, 0]);
         }
         
         let mut pos = 12;
@@ -463,26 +1004,69 @@ impl DNSBLServer {
         while pos < query.len() && query[pos] != 0 {
             let len = query[pos] as usize;
             if pos + len + 1 >= query.len() {
-                return (None, false);
+                return (None, false, [0, 0]);
             }
             
             let part = &query[pos + 1..pos + 1 + len];
             match String::from_utf8(part.to_vec()) {
                 Ok(part_str) => domain_parts.push(part_str),
-                Err(_) => return (None, false),
+                Err(_) => return (None, false, [0, 0]),
             }
             pos += len + 1;
             
             if pos >= query.len() {
-                return (None, false);
+                return (None, false, [0, 0]);
             }
         }
         
-        if domain_parts.is_empty() {
-            return (None, true);
+        if pos >= query.len() {
+            return (None, false, [0, 0]);
         }
         
-        (Some(domain_parts.join(".")), true)
+        pos += 1; // Sauter le 0
+        
+        // Lire le type (2 bytes) et la classe (2 bytes)
+        if pos + 4 <= query.len() {
+            let qtype = [query[pos], query[pos+1]];
+            let _qclass = [query[pos+2], query[pos+3]];
+            
+            if domain_parts.is_empty() {
+                (None, true, qtype)
+            } else {
+                (Some(domain_parts.join(".")), true, qtype)
+            }
+        } else {
+            (None, false, [0, 0])
+        }
+    }
+    
+    fn domain_to_labels(&self, domain: &str) -> Vec<u8> {
+        let mut result = Vec::new();
+        for part in domain.split('.') {
+            result.push(part.len() as u8);
+            result.extend_from_slice(part.as_bytes());
+        }
+        result.push(0);
+        result
+    }
+    
+    fn qtype_to_string(&self, qtype: &[u8]) -> String {
+        if qtype.len() < 2 {
+            return "UNKNOWN".to_string();
+        }
+        let value = u16::from_be_bytes([qtype[0], qtype[1]]);
+        match value {
+            1 => "A".to_string(),
+            2 => "NS".to_string(),
+            5 => "CNAME".to_string(),
+            6 => "SOA".to_string(),
+            12 => "PTR".to_string(),
+            15 => "MX".to_string(),
+            16 => "TXT".to_string(),
+            28 => "AAAA".to_string(),
+            255 => "ANY".to_string(),
+            _ => format!("TYPE-{}", value),
+        }
     }
     
     fn copy_question_section(&self, query: &[u8], response: &mut Vec<u8>) -> Option<()> {
@@ -555,13 +1139,31 @@ impl DNSBLServer {
         let socket = UdpSocket::bind(socket_addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         
-        info!("DNSBL server started on {}", socket_addr);
+        info!("DNSBL server v2.5.0 started on {}", socket_addr);
+        info!("Self-domain A/NS/SOA record support enabled (case-insensitive)");
+        info!("Real-time DNSBL forwarding support enabled with NS discovery (trust-dns)");
+        
+        if self.query_logger.enabled {
+            info!("Query logging enabled");
+        }
+        
         if self.rate_limiter.max_requests_per_minute > 0 {
             info!("Rate limiting: {} requests per minute", self.rate_limiter.max_requests_per_minute);
             info!("Allowed IPs/ranges: {}", self.rate_limiter.allowed_ips.len());
         } else {
             info!("Rate limiting: disabled");
         }
+        
+        // Afficher les zones configurées
+        for zone in self.zones.values() {
+            let dnsbl_count = zone.sources.iter()
+                .filter(|s| matches!(s, SourceType::Dnsbl(_)))
+                .count();
+            info!("Zone: {} -> {} (self: {}, {} sources, {} DNSBL forwarders)",
+                  zone.domain, zone.response_ip, zone.self_ip, 
+                  zone.sources.len(), dnsbl_count);
+        }
+        
         info!("Press Ctrl+C to stop the server");
         
         // Thread pour les statistiques si demandé
@@ -672,12 +1274,34 @@ fn setup_logging(log_file: Option<&str>, verbose: bool) -> Result<(), fern::Init
     Ok(())
 }
 
+// Fonction pour lire un fichier de sources
+fn read_source_file(filename: &str) -> io::Result<Vec<String>> {
+    let file = File::open(filename)?;
+    let reader = BufReader::new(file);
+    let mut sources = Vec::new();
+    
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line?.trim().to_string();
+        if !line.is_empty() && !line.starts_with('#') {
+            // Validation basique
+            if line.starts_with("http://") || line.starts_with("https://") || 
+               line.starts_with("dnsbl://") || Path::new(&line).exists() {
+                sources.push(line);
+            } else {
+                warn!("Invalid source at line {}: {} (ignored)", line_num + 1, line);
+            }
+        }
+    }
+    
+    Ok(sources)
+}
+
 // Parse command line arguments
-fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, u64, RateLimiterConfig), String> {
+fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, u64, RateLimiterConfig, Option<String>), String> {
     let matches = App::new("DNSBL Server")
-        .version("2.2.0")
+        .version("2.5.0")
         .author("Philippe TEMESI")
-        .about("A multi-zone DNSBL server with self-domain A records support and rate limiting")
+        .about("A multi-zone DNSBL server with NS record support and real-time DNSBL forwarding")
         .arg(
             Arg::with_name("domain")
                 .short("D")
@@ -701,7 +1325,7 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
                 .short("s")
                 .long("self-ip")
                 .value_name("IP")
-                .help("IP address to return for A record queries on the domain itself")
+                .help("IP address to return for A/NS/SOA queries on the domain itself")
                 .takes_value(true)
                 .multiple(true)
         )
@@ -710,7 +1334,16 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
                 .short("f")
                 .long("file")
                 .value_name("SOURCE")
-                .help("Blocklist source")
+                .help("Blocklist source (file, http://, https://, or dnsbl://domain)")
+                .takes_value(true)
+                .multiple(true)
+        )
+        .arg(
+            Arg::with_name("file-list")
+                .short("F")
+                .long("file-list")
+                .value_name("FILE")
+                .help("File containing one source per line (supports http://, https://, dnsbl://)")
                 .takes_value(true)
                 .multiple(true)
         )
@@ -745,6 +1378,13 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
                 .help("Interval for rate limiting stats logging (0 = disabled)")
                 .takes_value(true)
                 .default_value("0")
+        )
+        .arg(
+            Arg::with_name("query-log")
+                .long("query-log")
+                .value_name("FILE")
+                .help("Log all DNS queries to this file")
+                .takes_value(true)
         )
         .arg(
             Arg::with_name("daemon")
@@ -785,6 +1425,8 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
     
     let stats_interval = matches.value_of("stats-interval").unwrap_or("0").parse::<u64>()
         .map_err(|_| "Invalid stats-interval value")?;
+    
+    let query_log = matches.value_of("query-log").map(String::from);
     
     let no_limit_input = matches.value_of("no-request-limit").unwrap_or("");
     let mut no_limit_ips = Vec::new();
@@ -840,7 +1482,22 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
         ));
     }
     
-    let all_sources = matches.values_of_lossy("file").unwrap_or_default();
+    let mut all_sources = matches.values_of_lossy("file").unwrap_or_default();
+    
+    // Ajouter les sources depuis les fichiers -F
+    if let Some(file_lists) = matches.values_of_lossy("file-list") {
+        for list_file in file_lists {
+            match read_source_file(&list_file) {
+                Ok(sources) => {
+                    info!("Loaded {} sources from file: {}", sources.len(), list_file);
+                    all_sources.extend(sources);
+                }
+                Err(e) => {
+                    return Err(format!("Error reading file list {}: {}", list_file, e));
+                }
+            }
+        }
+    }
     
     let mut zone_configs = Vec::new();
     let mut source_index = 0;
@@ -854,7 +1511,16 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
         
         let mut zone_sources = Vec::new();
         
-        if i == domains.len() - 1 {
+        // Distribuer les sources entre les zones
+        if i < domains.len() - 1 {
+            // Pas la dernière zone : prendre une partie des sources
+            let sources_per_zone = if domains.len() > 0 { all_sources.len() / domains.len() } else { 0 };
+            let start = i * sources_per_zone;
+            let end = start + sources_per_zone;
+            for j in start..end.min(all_sources.len()) {
+                zone_sources.push(all_sources[j].clone());
+            }
+        } else {
             // Dernière zone : prendre tous les fichiers restants
             while source_index < all_sources.len() {
                 zone_sources.push(all_sources[source_index].clone());
@@ -884,6 +1550,7 @@ fn parse_args() -> Result<(Vec<ZoneConfig>, String, bool, bool, Option<String>, 
         matches.value_of("log").map(String::from),
         reload_minutes,
         rate_limiter_config,
+        query_log,
     ))
 }
 
@@ -901,7 +1568,7 @@ struct RateLimiterConfig {
 }
 
 fn main() {
-    let (zone_configs, interface, verbose, daemon_mode, log_file, reload_minutes, rate_config) = match parse_args() {
+    let (zone_configs, interface, verbose, daemon_mode, log_file, reload_minutes, rate_config, query_log) = match parse_args() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -914,8 +1581,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    info!("DNSBL Server v2.2.0 - 2026, Philippe TEMESI");
-    info!("Self-domain A record support enabled (case-insensitive)");
+    info!("DNSBL Server v2.5.0 - 2026, Philippe TEMESI");
+    info!("Self-domain A/NS/SOA record support enabled (case-insensitive)");
+    info!("Real-time DNSBL forwarding support enabled with NS discovery (trust-dns)");
 
     if daemon_mode {
         info!("Starting in daemon mode...");
@@ -931,14 +1599,36 @@ fn main() {
         info!("Daemon started successfully");
     }
     
-    // Créer les zones
+    // Initialiser le logger de requêtes
+    let query_logger = match QueryLogger::new(query_log) {
+        Ok(logger) => logger,
+        Err(e) => {
+            error!("Failed to create query logger: {}", e);
+            std::process::exit(1);
+        }
+    };
+    
+    // Créer les zones avec les sources typées
     let mut zones_map = HashMap::new();
     
     for config in zone_configs {
-        info!("Creating zone: {} -> {} (self: {}, {} sources)", 
-              config.domain, config.response_ip, config.self_ip, config.sources.len());
+        let mut typed_sources = Vec::new();
         
-        let zone = Zone::new(&config.domain, config.response_ip, config.self_ip, config.sources);
+        for source in config.sources {
+            if source.starts_with("http://") || source.starts_with("https://") {
+                typed_sources.push(SourceType::Http(source));
+            } else if source.starts_with("dnsbl://") {
+                let domain = source.trim_start_matches("dnsbl://").to_string();
+                typed_sources.push(SourceType::Dnsbl(domain));
+            } else {
+                typed_sources.push(SourceType::File(source));
+            }
+        }
+        
+        info!("Creating zone: {} -> {} (self: {}, {} sources)", 
+              config.domain, config.response_ip, config.self_ip, typed_sources.len());
+        
+        let zone = Zone::new(&config.domain, config.response_ip, config.self_ip, typed_sources);
         zones_map.insert(config.domain.clone(), zone);
     }
     
@@ -964,7 +1654,7 @@ fn main() {
     );
     
     // Créer le serveur avec les zones chargées et le rate limiter
-    let server = DNSBLServer::with_zones_and_limiter(zones_map, rate_limiter);
+    let server = DNSBLServer::with_zones_and_limiter(zones_map, rate_limiter, query_logger);
     
     // Démarrer le reloader si nécessaire
     if reload_minutes > 0 {
