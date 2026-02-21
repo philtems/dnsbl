@@ -1425,26 +1425,30 @@ fn find_zone_and_check_a(&self, domain: &str) -> (Option<&Zone>, Option<String>,
     }
     
     let last_four = &parts[parts.len() - 4..];
-    let octets: Result<Vec<u8>, _> = last_four
+    
+    // Récupérer les octets dans l'ordre du domaine (non inversé)
+    let domain_octets: Result<Vec<u8>, _> = last_four
         .iter()
-        .rev()
         .map(|s| s.parse::<u8>())
         .collect();
     
-    let octets = match octets {
+    let domain_octets = match domain_octets {
         Ok(o) if o.len() == 4 => o,
         _ => return (None, None, None),
     };
     
-    let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-    
-    // Vérifier d'abord si c'est une requête de test
-    if zone.is_test_query(ip.octets()) {
+    // Vérifier si c'est une requête de test en regardant les octets du domaine
+    if domain_octets == TEST_IP_OCTETS {
         debug!("[{}] Test query detected for domain {}, returning positive", zone.domain, domain);
-        return (Some(zone), Some("test".to_string()), Some(ip));
+        // Pour la réponse, on utilise l'IP de test configurée (response_ip de la zone)
+        return (Some(zone), Some("test".to_string()), Some(zone.response_ip));
     }
     
-    // Sinon, vérifier normalement
+    // Inverser pour obtenir l'IP réelle
+    let ip = Ipv4Addr::new(
+        domain_octets[3], domain_octets[2], domain_octets[1], domain_octets[0]
+    );
+    
     let (blocked, source) = zone.is_blocked(ip);
     if blocked {
         (Some(zone), source, Some(ip))
