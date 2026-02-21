@@ -1404,24 +1404,54 @@ impl DNSBLServer {
         }
     }
     
-    fn find_zone_and_check_a(&self, domain: &str) -> (Option<&Zone>, Option<String>, Option<Ipv4Addr>) {
-        let zone = match self.find_zone(domain) {
-            Some(z) => z,
-            None => return (None, None, None),
-        };
-        
-        let ip = match zone.extract_ip_from_domain(domain) {
-            Some(ip) => ip,
-            None => return (None, None, None),
-        };
-        
-        let (blocked, source) = zone.is_blocked(ip);
-        if blocked {
-            (Some(zone), source, Some(ip))
-        } else {
-            (None, None, None)
-        }
+fn find_zone_and_check_a(&self, domain: &str) -> (Option<&Zone>, Option<String>, Option<Ipv4Addr>) {
+    let zone = match self.find_zone(domain) {
+        Some(z) => z,
+        None => return (None, None, None),
+    };
+    
+    let domain_lower = domain.to_lowercase();
+    let zone_domain_lower = zone.domain_lowercase.to_lowercase();
+    
+    if !domain_lower.ends_with(&format!(".{}", zone_domain_lower)) {
+        return (None, None, None);
     }
+    
+    let ip_part = &domain_lower[..domain_lower.len() - zone_domain_lower.len() - 1];
+    let parts: Vec<&str> = ip_part.split('.').collect();
+    
+    if parts.len() < 4 {
+        return (None, None, None);
+    }
+    
+    let last_four = &parts[parts.len() - 4..];
+    let octets: Result<Vec<u8>, _> = last_four
+        .iter()
+        .rev()
+        .map(|s| s.parse::<u8>())
+        .collect();
+    
+    let octets = match octets {
+        Ok(o) if o.len() == 4 => o,
+        _ => return (None, None, None),
+    };
+    
+    let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+    
+    // Vérifier d'abord si c'est une requête de test
+    if zone.is_test_query(ip.octets()) {
+        debug!("[{}] Test query detected for domain {}, returning positive", zone.domain, domain);
+        return (Some(zone), Some("test".to_string()), Some(ip));
+    }
+    
+    // Sinon, vérifier normalement
+    let (blocked, source) = zone.is_blocked(ip);
+    if blocked {
+        (Some(zone), source, Some(ip))
+    } else {
+        (None, None, None)
+    }
+}
     
     fn find_zone_and_check_txt(&self, domain: &str) -> (Option<&Zone>, Option<String>, Option<Ipv4Addr>, Option<String>) {
         let zone = match self.find_zone(domain) {
