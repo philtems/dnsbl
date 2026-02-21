@@ -1,0 +1,36 @@
+[Unit]
+Description=DNSBL Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=dnsbl
+Group=dnsbl
+RuntimeDirectory=dnsbl-server
+RuntimeDirectoryMode=0755
+
+# Sécurité
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/dnsbl /var/log/dnsbl
+ReadOnlyPaths=/etc/dnsbl
+
+# Configuration
+EnvironmentFile=-/etc/default/dnsbl-server
+ExecStart=/usr/local/bin/dnsbl-server $DAEMON_OPTS
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnsbl-server
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+

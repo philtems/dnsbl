@@ -1,0 +1,11 @@
+dnsbl://zen.spamhaus.org
+dnsbl://b.barracudacentral.org
+dnsbl://bl.spamcop.net
+dnsbl://bl.nordspam.com
+
+http://www.example.com/blocklist.txt
+https://lists.blocklist.de/lists/all.txt
+
+/var/lib/dnsbl/custom.list
+/etc/dnsbl/local.list
+
