@@ -1,0 +1,191 @@
+; ============================================================================
+; Configuration file for DNSBL Server v2.9.0
+; INI format with sections
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; [global] section - Global server options
+; ----------------------------------------------------------------------------
+[global]
+
+; Listening interface (address:port)
+; Default: 0.0.0.0:53
+interface = 0.0.0.0:53
+
+; Maximum requests per minute per IP (0 = unlimited)
+; Default: 0
+max-requests = 100
+
+; File containing IPs/networks exempt from rate limiting (one per line)
+no-request-limit-file = /etc/dnsbl/exempt.conf
+
+; Alternative: direct list of IPs/networks (comma-separated)
+; no-request-limit = 127.0.0.1,192.168.1.0/24,10.0.0.0/8
+
+; File containing denied IPs/networks (one per line)
+deny-file = /etc/dnsbl/deny.conf
+
+; Rate limiting stats logging interval (seconds, 0 = disabled)
+; Default: 0
+stats-interval = 60
+
+; DNS query log file (text format)
+query-log = /var/log/dnsbl/queries.log
+
+; File to save IPs found in remote DNSBLs
+dbl-save = /var/log/dnsbl/dbl_ips.log
+
+; Auto-reload interval for sources (minutes, 0 = disabled)
+; Default: 0
+reload = 60
+
+; Daemon mode (true/false)
+; Default: false
+daemon = true
+
+; Verbose mode (debug) (true/false)
+; Default: false
+verbose = false
+
+; Main server log file
+log = /var/log/dnsbl/server.log
+
+
+; ----------------------------------------------------------------------------
+; [domain "domain.name"] section - DNSBL zone configuration
+; Repeat for each domain
+; ----------------------------------------------------------------------------
+
+; ============================================================================
+; First zone: dnsbl1.example.com
+; ============================================================================
+[domain "dnsbl1.example.com"]
+
+; Response IP for blocked IPs (usually 127.0.0.2)
+; Default: 127.0.0.2
+response = 127.0.0.2
+
+; IP to return for queries on the domain itself (A, NS, SOA)
+; Default: 127.0.0.2
+self = 192.168.1.10
+
+; TXT record for the domain (supports @, @dotted, @reversed substitutions)
+; Can be repeated multiple times
+txt = "This IP @dotted is listed in our database"
+txt = "Listed since 2026 - Contact abuse@example.com"
+
+; MX record (format: server,priority)
+; Can be repeated multiple times
+mx = mail.example.com,10
+mx = backup-mail.example.com,20
+
+; Blocklist sources (local file, HTTP/HTTPS URL, remote DNSBL)
+; Can be repeated multiple times
+
+; Source: local file
+source = /etc/dnsbl/lists/blocklist.txt
+
+; Source: local file with IPs and CIDR ranges
+source = /etc/dnsbl/lists/ranges.txt
+
+; Source: HTTP URL
+source = http://www.example.com/blocklist.txt
+
+; Source: HTTPS URL
+source = https://lists.example.com/blocklist.txt
+
+; Source: remote DNSBL (real-time forwarding)
+source = dnsbl://dnsbl.example.org
+
+; Source: remote DNSBL with different providers
+source = dnsbl://zen.spamhaus.org
+source = dnsbl://b.barracudacentral.org
+
+; File containing a list of sources (one per line)
+source-file = /etc/dnsbl/sources/dnsbl1.list
+
+
+; ============================================================================
+; Second zone: blacklist.example.net
+; ============================================================================
+[domain "blacklist.example.net"]
+
+response = 127.0.0.3
+self = 192.168.1.11
+
+; TXT record with substitutions
+txt = "IP @reversed (dotted: @dotted) is blocked"
+
+; MX record
+mx = mx1.example.net,5
+
+; Mixed sources
+source = /etc/dnsbl/lists/custom_blacklist.txt
+source = https://lists.example.net/blocklist.txt
+source = dnsbl://dnsbl.example.net
+source-file = /etc/dnsbl/sources/blacklist.sources
+
+
+; ============================================================================
+; Third zone: spam.example.org
+; ============================================================================
+[domain "spam.example.org"]
+
+response = 127.0.0.4
+self = 192.168.1.12
+
+; No TXT or MX for this zone
+
+; Multiple sources
+source = /etc/dnsbl/lists/spam_ips.txt
+source = https://spam.example.org/blocklist.txt
+source = dnsbl://dnsbl1.spamhaus.org
+source = dnsbl://dnsbl2.spamhaus.org
+source = dnsbl://dnsbl3.spamhaus.org
+source-file = /etc/dnsbl/sources/spam.sources
+
+
+; ============================================================================
+; Fourth zone: dnsbl.local (local test zone)
+; ============================================================================
+[domain "dnsbl.local"]
+
+response = 127.0.0.5
+self = 127.0.0.1
+
+; Simple TXT record
+txt = "Local test zone"
+
+; Local source only
+source = /etc/dnsbl/lists/local_blacklist.txt
+
+
+; ============================================================================
+; Example no-request-limit-file (/etc/dnsbl/exempt.conf)
+; ============================================================================
+; # IPs and networks exempt from rate limiting
+; 127.0.0.1
+; 192.168.1.0/24
+; 10.0.0.0/8
+; 172.16.0.0/12
+; ::1
+
+
+; ============================================================================
+; Example deny-file (/etc/dnsbl/deny.conf)
+; ============================================================================
+; # Denied IPs and networks
+; 1.2.3.4
+; 5.6.7.0/24
+; 192.168.2.0/24
+
+
+; ============================================================================
+; Example source-file (/etc/dnsbl/sources/dnsbl1.list)
+; ============================================================================
+; # List of sources (one per line)
+; # Comments allowed
+; /etc/dnsbl/lists/extra1.txt
+; https://example.com/list.txt
+; dnsbl://dnsbl.example.com
+
