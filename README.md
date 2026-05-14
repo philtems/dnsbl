@@ -1,536 +1,696 @@
-# DNSBL Server v2.9.0
+# DNSBL Server User Manual
 
-A complete multi-zone DNSBL (DNS Blackhole List) server with NS/SOA/MX/TXT record support, real-time DNSBL forwarding, and advanced logging.
+**Version 2.9.0** \| **Philippe TEMESI** \| [**https://www.tems.be**](https://www.tems.be/)
 
-## Features
+## Table of Contents
 
-- **Multi-zone support**: Handle multiple DNSBL domains simultaneously
-- **Full DNS record support**: A, NS, SOA, MX, and TXT records for self-domain queries
-- **TXT record substitution**: Dynamic insertion of IP in TXT responses (`@`, `@dotted`, `@reversed`)
-- **DNSBL forwarding**: Query remote DNSBLs in real-time (`dnsbl://`)
-- **Automatic NS discovery**: Find authoritative servers of remote DNSBLs recursively
-- **Intelligent caching**: Cache DNSBL query results (5 minutes) and NS servers (1 hour)
-- **Round-robin rotation**: Distribute queries among NS servers for load balancing
-- **Rate limiting**: Limit queries per IP address with exempt lists
-- **Dual logging**: Application logs and dedicated query logs
-- **Auto-reload**: Periodically reload source files
-- **HTTP/HTTPS support**: Download blocklists from URLs
-- **Daemon mode**: Run as a background service
-- **Configuration file**: INI-format configuration with multiple zones
+1.  Introduction
 
-## Installation
+2.  Quick Start
 
-### Prerequisites
+3.  DNSBL Query Tool (*dnsbl-query*)
 
-- Rust (2021 edition)
-- Cargo
+4.  DNSBL Server (*dnsbl-server*)
 
-### Build
+    -   Configuration File (INI Format)
+    -   Command-Line Options
+    -   Zone Configuration
 
-git clone "https://github.com/philtems/dnsbl.git"
-cd dnsbl
-cargo build --release
+5.  Source Types
 
-The binary will be at `target/release/dnsbl-server`
+6.  DNS Record Support
 
-## Usage
+7.  Access Control
 
-### Two Configuration Modes
+8.  Logging
 
-1. **Command-line mode** (legacy, simple setups)
-2. **Configuration file mode** (recommended for complex setups)
+9.  Auto-Reload
 
-### Configuration File (Recommended)
+10. Real-Time DNSBL Forwarding
 
-Create an INI file (e.g., `/etc/dnsbl/server.conf`):
+11. Test Queries
 
-; ======================================
-; DNSBL Server v2.9.0 Configuration File
-; ======================================
+12. Examples
 
-; ----------------------------------------
-; [global] section - Global server options
-; ----------------------------------------
-[global]
+## Introduction
 
-; Listening interface (address:port)
-; Default: 0.0.0.0:53
+The DNSBL Server is a complete toolkit for running DNS-based Blocklists (DNSBL). It provides:
+
+-   **DNSBL Server** (*dnsbl-server*): A full-featured DNS server that responds to blocklist queries
+-   **DNSBL Query Tool** (*dnsbl-query*): A client tool to test if an IP address is listed
+
+Key features:
+
+-   Multi-zone support (run multiple DNSBL domains on a single server)
+-   HTTP/HTTPS and local file blocklist sources
+-   Real-time DNSBL forwarding with recursive NS discovery
+-   NS, SOA, MX, and TXT record support for your DNSBL domains
+-   Rate limiting and IP-based access control
+-   Query logging and DBL saving
+-   Auto-reload of blocklists
+
+## Quick Start
+
+### Basic Server with One Zone
+
+
+dnsbl-server -D dnsbl.example.com -r 127.0.0.2 -s 192.168.1.100 -f /path/to/blocklist.txt
+
+### Query an IP Address
+
+
+dnsbl-query -d dnsbl.example.com 192.168.1.100
+
+### Using a Configuration File
+
+
+dnsbl-server \--config /etc/dnsbl/server.ini
+
+## DNSBL Query Tool (*dnsbl-query*)
+
+The query tool checks whether an IP address is listed in a DNSBL.
+
+### Usage
+
+
+dnsbl-query \[OPTIONS\] -d DOMAIN IP_ADDRESS
+
+### Options
+
+  -------------------------- -----------------------------------------------
+  *-d, \--domain DOMAIN*     DNSBL domain to query (e.g., *dnsbl.tems.be*)
+  *-s, \--server SERVER*     DNS server to use (default: *127.0.0.1:53*)
+  *-t, \--timeout SECONDS*   DNS query timeout (default: 5 seconds)
+  *-v, \--verbose*           Enable verbose output
+  *-q, \--quiet*             Quiet mode - output only the result
+  *-h, \--help*              Show help information
+  -------------------------- -----------------------------------------------
+
+### Output Formats
+
+**Normal mode** (default):
+
+-   *✅ IP x.x.x.x is CLEAN* - IP not listed
+-   *✅ IP x.x.x.x is BLOCKED* - IP is listed, with response IP and reason
+
+**Quiet mode** (*-q*):
+
+-   *CLEAN* - IP not listed
+-   *BLOCKED:x.x.x.x* - IP is blocked (x.x.x.x is the response IP)
+-   *ERROR:message* - An error occurred
+
+### Examples
+
+
+\# Query using system DNS
+
+dnsbl-query -d dnsbl.tems.be 192.168.1.100
+
+\# Query using Google DNS
+
+dnsbl-query -d dnsbl.tems.be -s 8.8.8.8 192.168.1.100
+
+\# Query with custom port and verbose output
+
+dnsbl-query -d dnsbl.tems.be -s 127.0.0.1:5453 -v 192.168.1.100
+
+\# Quiet mode for scripting
+
+dnsbl-query -d dnsbl.tems.be -q 192.168.1.100
+
+### Response Code Interpretation
+
+When verbose mode is enabled, the tool interprets common DNSBL response codes:
+
+  ----------- ----------------------
+  127.0.0.2   General spam source
+  127.0.0.3   High confidence spam
+  127.0.0.4   Open proxy
+  127.0.0.5   Open relay
+  127.0.0.6   Hacked/Compromised
+  127.0.0.7   Dynamic IP
+  127.0.0.8   Dialup IP
+  127.0.0.9   Blacklisted
+  ----------- ----------------------
+
+## DNSBL Server (*dnsbl-server*)
+
+The server listens for DNS queries and responds based on configured blocklists.
+
+### Configuration Methods
+
+The server can be configured in two ways:
+
+1.  **Configuration file (INI format)** - Recommended for complex setups
+2.  **Command-line arguments** - Simple setups or legacy compatibility
+
+### Configuration File (INI Format)
+
+The configuration file uses INI format with a *\[global\]* section and one or more *\[domain \"\...\"\]* sections.
+
+#### Global Section
+
+
+\[global\]
+
 interface = 0.0.0.0:53
 
-; Maximum requests per minute per IP (0 = unlimited)
-; Default: 0
-max-requests = 100
+max-requests = 60
 
-; File containing IPs/networks exempt from rate limiting (one per line)
-no-request-limit-file = /etc/dnsbl/exempt.conf
+no-request-limit = 192.168.1.0/24,10.0.0.5
 
-; Alternative: direct list of IPs/networks (comma-separated)
-; no-request-limit = 127.0.0.1,192.168.1.0/24,10.0.0.0/8
+no-request-limit-file = /etc/dnsbl/exempt.txt
 
-; File containing denied IPs/networks (one per line)
-deny-file = /etc/dnsbl/deny.conf
+deny-file = /etc/dnsbl/deny.txt
 
-; Rate limiting stats logging interval (seconds, 0 = disabled)
-; Default: 0
 stats-interval = 60
 
-; DNS query log file (text format)
 query-log = /var/log/dnsbl/queries.log
 
-; File to save IPs found in remote DNSBLs
-dbl-save = /var/log/dnsbl/dbl_ips.log
+dbl-save = /var/lib/dnsbl/blocked_ips.txt
 
-; Auto-reload interval for sources (minutes, 0 = disabled)
-; Default: 0
-reload = 60
+reload = 30
 
-; Daemon mode (true/false)
-; Default: false
 daemon = true
 
-; Verbose mode (debug) (true/false)
-; Default: false
 verbose = false
 
-; Main server log file
 log = /var/log/dnsbl/server.log
 
+#### Global Options
 
-; -------------------------------------------------
-; [domain "..."] section - DNSBL zone configuration
-; Repeat for each domain
-; -------------------------------------------------
+  ------------------------- -----------------------------------------------------
+  *interface*               Network interface to bind (IP:port)
+  *max-requests*            Max requests per minute per IP (0 = unlimited)
+  *no-request-limit*        Comma-separated IPs/CIDRs exempt from rate limiting
+  *no-request-limit-file*   File with exempt IPs/CIDRs (one per line)
+  *deny-file*               File with IPs/CIDRs denied access (one per line)
+  *stats-interval*          Interval for rate limiting stats logging (seconds)
+  *query-log*               File path for DNS query logs
+  *dbl-save*                File path to save IPs found in remote DNSBLs
+  *reload*                  Auto-reload interval (minutes, 0 = disabled)
+  *daemon*                  Run as daemon (true/false)
+  *verbose*                 Enable verbose logging (true/false)
+  *log*                     Server log file path
+  ------------------------- -----------------------------------------------------
 
-; ==============================
-; First zone: dnsbl1.example.com
-; ==============================
-[domain "dnsbl1.example.com"]
+#### Zone Section
 
-; Response IP for blocked IPs (usually 127.0.0.2)
-; Default: 127.0.0.2
+Each zone is defined with *\[domain \"your.domain.com\"\]*:
+
+
+\[domain \"dnsbl.example.com\"\]
+
 response = 127.0.0.2
 
-; IP to return for queries on the domain itself (A, NS, SOA)
-; Default: 127.0.0.2
-self = 192.168.1.10
+self = 192.168.1.100
 
-; TXT record for the domain (supports @, @dotted, @reversed substitutions)
-; Can be repeated multiple times
-txt = "This IP @dotted is listed in our database"
-txt = "Listed since 2026 - Contact abuse@example.com"
+txt = \"Spam source - see https://example.com/remove\"
 
-; MX record (format: server,priority)
-; Can be repeated multiple times
 mx = mail.example.com,10
-mx = backup-mail.example.com,20
 
-; Blocklist sources (local file, HTTP/HTTPS URL, remote DNSBL)
-; Can be repeated multiple times
+source = /var/lib/dnsbl/blocklist.txt
 
-; Source: local file
-source = /etc/dnsbl/lists/blocklist.txt
-
-; Source: local file with IPs and CIDR ranges
-source = /etc/dnsbl/lists/ranges.txt
+source = https://example.com/blocklist.txt
 
-; Source: HTTP URL
-source = http://www.example.com/blocklist.txt
+source = dnsbl://other-dnsbl.example.com
 
-; Source: HTTPS URL
-source = https://lists.example.com/blocklist.txt
+source-file = /etc/dnsbl/sources.txt
 
-; Source: remote DNSBL (real-time forwarding)
-source = dnsbl://dnsbl.example.org
+#### Zone Options
 
-; Source: remote DNSBL with different providers
-source = dnsbl://zen.spamhaus.org
-source = dnsbl://b.barracudacentral.org
+  --------------- ------------------------------------------------------------------
+  *response*      IP address returned for blocked queries
+  *self*          IP address returned for queries to the domain itself
+  *txt*           TXT record (supports *@*, *\@dotted*, *\@replaced* placeholders)
+  *mx*            MX record (format: *server,priority*)
+  *source*        Blocklist source (file, http://, https://, or dnsbl://domain)
+  *source-file*   File containing one source per line
+  --------------- ------------------------------------------------------------------
 
-; File containing a list of sources (one per line)
-source-file = /etc/dnsbl/sources/dnsbl1.list
+### Command-Line Options
 
+When not using a config file, command-line options are available:
 
-; ==================================
-; Second zone: blacklist.example.net
-; ==================================
-[domain "blacklist.example.net"]
+#### Server Options
 
-response = 127.0.0.3
-self = 192.168.1.11
+  ------------------------------ ---------------------------------------------
+  *-i, \--interface INTERFACE*   Listening interface (default: *0.0.0.0:53*)
+  *-v, \--verbose*               Enable verbose mode
+  *-d, \--daemon*                Run as daemon
+  *\--no-daemon*                 Do not run as daemon (override config)
+  *-l, \--log LOG_FILE*          Server log file
+  *-R, \--reload MINUTES*        Auto-reload interval (minutes)
+  *\--config FILE*               Use configuration file
+  ------------------------------ ---------------------------------------------
 
-; TXT record with substitutions
-txt = "IP @reversed (dotted: @dotted) is blocked"
+#### Access Control Options
 
-; MX record
-mx = mx1.example.net,5
+  ------------------------------------- -------------------------------------
+  *\--max-requests COUNT*               Max requests per minute per IP
+  *\--no-request-limit IP,RANGE,\...*   IPs/CIDRs exempt from rate limiting
+  *\--no-request-limit-file FILE*       File with exempt IPs/CIDRs
+  *\--deny-file FILE*                   File with denied IPs/CIDRs
+  *\--stats-interval SECONDS*           Stats logging interval
+  ------------------------------------- -------------------------------------
 
-; Mixed sources
-source = /etc/dnsbl/lists/custom_blacklist.txt
-source = https://lists.example.net/blocklist.txt
-source = dnsbl://dnsbl.example.net
-source-file = /etc/dnsbl/sources/blacklist.sources
+#### Logging Options
 
+  --------------------- --------------------------
+  *\--query-log FILE*   Log DNS queries to file
+  *\--dbl-save FILE*    Save blocked IPs to file
+  --------------------- --------------------------
 
-; ============================
-; Third zone: spam.example.org
-; ============================
-[domain "spam.example.org"]
+#### Zone Options (per zone, repeatable)
 
-response = 127.0.0.4
-self = 192.168.1.12
+  ------------------------- --------------------------------------
+  *-D, \--domain DOMAIN*    DNSBL domain name
+  *-r, \--response IP*      Response IP for blocked queries
+  *-s, \--self-ip IP*       IP for self-domain queries
+  *-f, \--file SOURCE*      Blocklist source (file/URL/dnsbl://)
+  *-F, \--file-list FILE*   File containing sources
+  *\--txt TEXT*             TXT record for the domain
+  *\--mx SERVER,PRIORITY*   MX record for the domain
+  ------------------------- --------------------------------------
 
-; No TXT or MX for this zone
+> **Note**: When using multiple zones with command-line options, the number of *-D*, *-r*, and *-s* options must match. Sources are distributed evenly across zones.
 
-; Multiple sources
-source = /etc/dnsbl/lists/spam_ips.txt
-source = https://spam.example.org/blocklist.txt
-source = dnsbl://dnsbl1.spamhaus.org
-source = dnsbl://dnsbl2.spamhaus.org
-source = dnsbl://dnsbl3.spamhaus.org
-source-file = /etc/dnsbl/sources/spam.sources
+## Source Types
 
+The server supports three types of blocklist sources:
 
-; ==========================================
-; Fourth zone: dnsbl.local (local test zone)
-; ==========================================
-[domain "dnsbl.local"]
+### 1. Local File
 
-response = 127.0.0.5
-self = 127.0.0.1
 
-; Simple TXT record
-txt = "Local test zone"
+source = /path/to/blocklist.txt
 
-; Local source only
-source = /etc/dnsbl/lists/local_blacklist.txt
+File format: one IP address or CIDR range per line. Lines starting with *\#* are ignored.
 
-### Command-line Options
+Example blocklist file:
 
-| Option | Description |
-|--------|-------------|
-| `--config <FILE>` | Configuration file (INI format) |
-| `-D, --domain <DOMAIN>` | DNSBL domain (can be multiple) |
-| `-r, --response <IP>` | Response IP for blocked IPs |
-| `-s, --self-ip <IP>` | IP for queries on the domain itself |
-| `--txt <TEXT>` | TXT record for the domain |
-| `--mx <SERVER,PRIORITY>` | MX record (format: server,priority) |
-| `-f, --file <SOURCE>` | Blocklist source (file, URL, or dnsbl://) |
-| `-F, --file-list <FILE>` | File containing one source per line |
-| `-R, --reload <MINUTES>` | Reload interval (0 = disabled) |
-| `--max-requests <COUNT>` | Max requests per minute per IP (0 = unlimited) |
-| `--no-request-limit <IP,RANGE>` | IPs/ranges exempt from rate limiting |
-| `--no-request-limit-file <FILE>` | File with exempt IPs/ranges |
-| `--deny-file <FILE>` | File with denied IPs/ranges |
-| `--stats-interval <SECONDS>` | Statistics logging interval (0 = disabled) |
-| `--query-log <FILE>` | Query log file |
-| `--dbl-save <FILE>` | File to save IPs found in remote DNSBLs |
-| `-d, --daemon` | Daemon mode |
-| `--no-daemon` | Do not run in daemon mode (override config) |
-| `-i, --interface <INTERFACE>` | Listening interface (default: 0.0.0.0:53) |
-| `-v, --verbose` | Verbose mode |
-| `-l, --log <LOG_FILE>` | Application log file |
 
-### Source Types
+\# My blocklist
 
-#### Local Files
+192.168.1.100
 
--f /path/to/blocklist.txt
+10.0.0.0/24
 
-#### HTTP/HTTPS URLs
+203.0.113.50
 
--f http://example.com/blocklist.txt
--f https://example.com/blocklist.txt
+### 2. HTTP/HTTPS URL
 
-#### Remote DNSBLs (real-time forwarding)
 
--f dnsbl://zen.spamhaus.org
--f dnsbl://b.barracudacentral.org
+source = https://example.com/blocklist.txt
 
-#### Multi-source File
+The server downloads the file from the URL. The same format as local files is expected.
 
--F sources.txt
+### 3. DNSBL Forwarder
 
-Example sources.txt:
-# Local list
-/var/lib/dnsbl/local.list
-# URLs
-http://www.example.com/blocklist.txt
-https://another.org/blacklist.txt
-# Remote DNSBLs
-dnsbl://zen.spamhaus.org
-dnsbl://b.barracudacentral.org
 
-## Examples
+source = dnsbl://other-dnsbl.example.com
 
-### Basic Single-Zone Server
+The server forwards queries to another DNSBL in real-time. The queried IP is checked against the remote DNSBL before returning a result.
 
-dnsbl-server -D bl.example.com -r 127.0.0.2 -s 192.168.1.100 -f /etc/dnsbl/blocklist.txt
+## DNS Record Support
 
-### Multi-Zone with Different Sources
+The server provides full DNS record support for your DNSBL domains.
 
-dnsbl-server \
-  -D bl1.example.com -r 127.0.0.2 -s 192.168.1.100 -f /etc/dnsbl/list1.txt \
-  -D bl2.example.com -r 127.0.0.3 -s 192.168.1.100 -f /etc/dnsbl/list2.txt
+### A Records (Type 1)
 
-### With DNSBL Forwarding and Logging
+-   **Queries for ***x.x.x.x.zone.domain*****: Returns *response* IP if the IP is blocked
+-   **Queries for ***zone.domain*****: Returns *self* IP
 
-dnsbl-server \
-  -D bl.example.com \
-  -r 127.0.0.2 \
-  -s 192.168.1.100 \
-  -f dnsbl://zen.spamhaus.org \
-  -f /etc/dnsbl/local.list \
-  --query-log /var/log/dnsbl-queries.log \
-  -l /var/log/dnsbl.log \
-  -v
+### NS Records (Type 2)
 
-### Daemon Mode with Rate Limiting
+Returns NS records for the domain, pointing to the *self* IP address.
 
-dnsbl-server \
-  -D bl.example.com \
-  -r 127.0.0.2 \
-  -s 192.168.1.100 \
-  -f dnsbl://zen.spamhaus.org \
-  --max-requests 100 \
-  --no-request-limit 192.168.1.0/24,10.0.0.1 \
-  -d \
-  -l /var/log/dnsbl.log
+### SOA Records (Type 6)
 
-### Using Configuration File
+Returns Start of Authority record for the domain.
 
-dnsbl-server --config /etc/dnsbl/server.conf
+### MX Records (Type 15)
 
-## Architecture
+Returns configured MX record for the domain.
 
-### How It Works
+### TXT Records (Type 16)
 
-1. **DNS query reception** on port 53 (or custom port)
-2. **Parsing** to extract domain and query type
-3. **Detection** of self-domain queries (A/NS/SOA/MX/TXT)
-4. **IP extraction** from subdomain (reverse format)
-5. **Checking**:
-   - Local lists (IPs and CIDR ranges)
-   - Remote DNSBLs (via forwarding)
-6. **Response**:
-   - Configured IP if blocked
-   - NXDOMAIN if not blocked
-   - Self-IP for domain queries
+Returns TXT information. Supports IP substitution placeholders:
 
-### DNSBL Forwarding
+  ------------------- -------------------------------------
+  *@* or *\@dotted*   Dotted IP format: *192.168.1.100*
+  *\@reversed*        Reversed IP format: *100.1.168.192*
+  ------------------- -------------------------------------
 
-For remote DNSBLs like zen.spamhaus.org:
+Example TXT with substitution:
 
-1. **NS discovery**: Query public resolvers for NS records of the remote DNSBL (recursive)
-2. **Resolution**: Resolve NS names to IP addresses
-3. **Caching**: Cache NS servers for 1 hour
-4. **Query**: For each IP to check, query an NS server directly (round-robin)
-5. **Result caching**: Cache results for 5 minutes
 
-## Testing
+txt = \"IP @ is listed in our blocklist. See https://example.com/remove?ip=@dotted\"
 
-### With dig
+For an IP *192.168.1.100*, this becomes:
 
-Test A record (blocked IP):
-dig @127.0.0.1 -p 5453 2.0.0.127.bl.example.com A
 
-Test A record (unblocked IP):
-dig @127.0.0.1 -p 5453 1.2.3.4.bl.example.com A
+\"IP 192.168.1.100 is listed in our blocklist. See https://example.com/remove?ip=192.168.1.100\"
 
-Test TXT record (blocked IP):
-dig @127.0.0.1 -p 5453 2.0.0.127.bl.example.com TXT
+## Access Control
 
-Test NS record on domain:
-dig @127.0.0.1 -p 5453 bl.example.com NS
+The server implements three layers of access control:
 
-Test MX record:
-dig @127.0.0.1 -p 5453 bl.example.com MX
+### 1. Deny List
 
-Test SOA record:
-dig @127.0.0.1 -p 5453 bl.example.com SOA
+IPs or CIDR ranges in the deny list are completely blocked from querying the server. No response is sent.
 
-### Test Script
 
-#!/bin/bash
+deny-file = /etc/dnsbl/deny.txt
 
-SERVER="127.0.0.1"
-PORT="5453"
-DOMAIN="bl.example.com"
+### 2. Exempt List (No Rate Limit)
 
-echo "=== DNSBL Server Test ==="
-echo
+IPs or CIDR ranges in the exempt list bypass rate limiting.
 
-echo "1. Self-domain A query:"
-dig @$SERVER -p $PORT $DOMAIN A +short
 
-echo "2. Self-domain NS query:"
-dig @$SERVER -p $PORT $DOMAIN NS +noall +answer
+no-request-limit = 192.168.1.0/24,10.0.0.5
 
-echo "3. Self-domain MX query:"
-dig @$SERVER -p $PORT $DOMAIN MX +short
+no-request-limit-file = /etc/dnsbl/exempt.txt
 
-echo "4. Self-domain TXT query:"
-dig @$SERVER -p $PORT $DOMAIN TXT +short
+### 3. Rate Limiting
 
-echo "5. Blocked IP (127.0.0.2) A record:"
-dig @$SERVER -p $PORT 2.0.0.127.$DOMAIN A +short
+Limits the number of queries per minute from a single IP address.
 
-echo "6. Blocked IP TXT record:"
-dig @$SERVER -p $PORT 2.0.0.127.$DOMAIN TXT +short
 
-echo "7. Unblocked IP:"
-dig @$SERVER -p $PORT 1.2.3.4.$DOMAIN A +short
+max-requests = 60
+
+When the limit is exceeded, the server returns a REFUSED response for the duration of the current minute.
+
+### Order of Evaluation
+
+1.  **Deny list** - If matched, query is rejected immediately
+2.  **Exempt list** - If matched, rate limiting is bypassed
+3.  **Rate limit check** - Applied only if not exempt
 
 ## Logging
 
-### Application Log
+### Server Log
 
-Format: `[timestamp][LEVEL] message`
+Logs server events including startup, errors, and reload operations.
 
-Example:
-[2026-02-20 14:50:20][INFO] DNSBL server v2.9.0 started on 127.0.0.1:5453
-[2026-02-20 14:50:20][INFO] Zone: bl.example.com -> 127.0.0.2 (self: 192.168.1.100, TXT: 2, MX: 1, 3 sources, 2 DNSBL forwarders)
-[2026-02-20 14:50:33][INFO] [bl.example.com] Blocked IP: 127.0.0.2 (domain: 2.0.0.127.bl.example.com from 127.0.0.1)
-[2026-02-20 14:50:35][INFO] [bl.example.com] TXT query for IP: 127.0.0.2 (domain: 2.0.0.127.bl.example.com from 127.0.0.1)
 
-### Query Log (--query-log)
+dnsbl-server \--log /var/log/dnsbl/server.log \--verbose
 
-Format: `[timestamp] source_ip domain qtype status [source:name]`
+### Query Log
 
-Example:
-[2026-02-20 14:50:33] 127.0.0.1 2.0.0.127.bl.example.com A A_RESPONSE 127.0.0.2 [source:local]
-[2026-02-20 14:50:34] 127.0.0.1 1.2.3.4.bl.example.com A NXDOMAIN
-[2026-02-20 14:50:35] 127.0.0.1 2.0.0.127.bl.example.com TXT TXT_RESPONSE "This IP 127.0.0.2 is listed"
-[2026-02-20 14:50:36] 127.0.0.1 bl.example.com A A_RESPONSE 192.168.1.100
+Logs all DNS queries received by the server.
 
-### DBL Save File (--dbl-save)
 
-Format: One IP per line
+dnsbl-server \--query-log /var/log/dnsbl/queries.log
 
-Example:
-192.168.1.1
-10.0.0.1
-172.16.0.1
+Query log format:
 
-## File Formats
 
-### Blocklist File
+\[2026-01-15 10:30:45\] 192.168.1.100 dnsbl.example.com A NXDOMAIN
 
-One IP or CIDR per line. Lines starting with # are ignored.
+\[2026-01-15 10:30:46\] 10.0.0.50 dnsbl.example.com A A_RESPONSE 127.0.0.2 \[source:local\]
 
-# Individual IPs
-192.168.1.1
-10.0.0.1
+\[2026-01-15 10:30:47\] 192.168.1.101 dnsbl.example.com TXT TXT_RESPONSE \"IP 192.168.1.100 is blocked\"
 
-# CIDR ranges
-192.168.1.0/24
-10.0.0.0/8
+Fields:
 
-### Source List File
+-   Timestamp
+-   Client IP address
+-   Query domain
+-   Query type (A, TXT, NS, MX, etc.)
+-   Status/Response (NXDOMAIN, A_RESPONSE IP, TXT_RESPONSE, etc.)
+-   Source (local, test, dnsbl:domain, ACTION:EXEMPT, etc.)
 
-One source per line. Supports # for comments.
+### DBL Save File
 
-# Local sources
-/etc/dnsbl/blacklist.txt
-/var/lib/dnsbl/custom.list
+Saves IP addresses that were found to be blocked by remote DNSBL forwarders.
 
-# URLs
-http://www.example.com/blocklist.txt
-https://example.org/blacklist.txt
 
-# Remote DNSBLs
-dnsbl://zen.spamhaus.org
-dnsbl://b.barracudacentral.org
+dnsbl-server \--dbl-save /var/lib/dnsbl/blocked_ips.txt
 
-### Exempt/Deny Files
+Each blocked IP appears on a separate line, deduplicated automatically.
 
-One IP or CIDR per line. Lines starting with # are ignored.
+## Auto-Reload
 
-127.0.0.1
-192.168.1.0/24
-10.0.0.0/8
-::1
+The server can automatically reload blocklists at regular intervals.
 
-## Performance
 
-- **DNSBL cache**: 5 minutes
-- **NS cache**: 1 hour
-- **DNS timeout**: 2 seconds
-- **Buffer size**: 512 bytes (RFC compliant)
-- **Threading**: Single-threaded with non-blocking I/O
+dnsbl-server -R 30 \... \# Reload every 30 minutes
+
+During reload:
+
+1.  The server re-downloads HTTP/HTTPS sources
+2.  Re-reads local file sources
+3.  Updates the in-memory blocklist without restarting
+4.  Existing queries continue to be served using the old data until reload completes
+
+> **Note**: DNSBL forwarder sources are not reloaded via this mechanism as they operate in real-time.
+
+## Real-Time DNSBL Forwarding
+
+When using *dnsbl://* sources, the server performs real-time DNSBL forwarding:
+
+### How It Works
+
+1.  A query for *x.x.x.x.your-zone.com* is received
+
+2.  The server extracts the IP address from the query
+
+3.  For each DNSBL forwarder source (*dnsbl://other-dnsbl.com*):
+
+    -   The server queries *x.x.x.x.other-dnsbl.com* (note: IP octets are reversed for DNSBL format)
+    -   If the remote DNSBL returns an A record, the IP is considered blocked
+    -   Results are cached for 5 minutes to reduce network traffic
+
+### NS Discovery
+
+The server automatically discovers NS servers for remote DNSBL domains:
+
+1.  Performs recursive NS record lookup
+2.  Resolves NS names to IP addresses
+3.  Caches NS servers for 1 hour
+4.  Uses round-robin selection among discovered servers
+
+### Fallback
+
+If NS discovery fails, fallback DNS servers (8.8.8.8, 1.1.1.1, 9.9.9.9) are used.
+
+### Example
+
+
+\[domain \"my-dnsbl.com\"\]
+
+response = 127.0.0.2
+
+self = 192.168.1.100
+
+source = dnsbl://spamhaus.example.com
+
+source = dnsbl://other-blocklist.net
+
+Now queries to *my-dnsbl.com* will also check *spamhaus.example.com* and *other-blocklist.net* in real-time.
+
+## Test Queries
+
+The server supports test queries using the IP *127.0.0.2* in reversed format.
+
+### Test Format
+
+Query domain: *2.0.0.127.\** - the *2.0.0.127* part matches the test pattern.
+
+### Example
+
+
+\# This query will always return a positive (blocked) response
+
+dig 2.0.0.127.dnsbl.example.com
+
+This is useful for:
+
+-   Testing server functionality
+-   Verifying DNS configuration
+-   Monitoring server health
+
+## Examples
+
+### Example 1: Simple Single-Zone Server
+
+
+\# Create a blocklist file
+
+echo \"192.168.1.100\" \> /tmp/blocklist.txt
+
+echo \"10.0.0.0/24\" \>\> /tmp/blocklist.txt
+
+\# Start the server
+
+dnsbl-server \\
+
+-D my-dnsbl.com \\
+
+-r 127.0.0.2 \\
+
+-s 192.168.1.100 \\
+
+-f /tmp/blocklist.txt \\
+
+-v
+
+### Example 2: Multi-Zone with Configuration File
+
+**/etc/dnsbl/server.ini:**
+
+
+\[global\]
+
+interface = 0.0.0.0:53
+
+max-requests = 120
+
+no-request-limit = 127.0.0.1
+
+query-log = /var/log/dnsbl/queries.log
+
+reload = 60
+
+daemon = true
+
+log = /var/log/dnsbl/server.log
+
+\[domain \"spam.example.com\"\]
+
+response = 127.0.0.2
+
+self = 10.0.0.1
+
+txt = \"This IP is a spam source\"
+
+source = https://example.com/spam-list.txt
+
+source = dnsbl://other-spam-list.net
+
+\[domain \"malware.example.com\"\]
+
+response = 127.0.0.3
+
+self = 10.0.0.1
+
+txt = \"Malware detected on IP @\"
+
+source = /var/lib/dnsbl/malware.txt
+
+source = https://malware-domains.com/dnsbl.txt
+
+mx = mail.example.com,10
+
+**Start the server:**
+
+
+dnsbl-server \--config /etc/dnsbl/server.ini
+
+### Example 3: DNSBL Forwarding Only
+
+
+\# Forward all queries to another DNSBL without local blocklist
+
+dnsbl-server \\
+
+-D forwarder.com \\
+
+-r 127.0.0.2 \\
+
+-s 192.168.1.100 \\
+
+-f dnsbl://upstream-dnsbl.org
+
+### Example 4: Testing with Query Tool
+
+
+\# Setup: Start server in one terminal
+
+dnsbl-server -D test.com -r 127.0.0.2 -s 127.0.0.1 -f /tmp/blocklist.txt
+
+\# In another terminal, test queries
+
+dnsbl-query -d test.com 192.168.1.100 -v
+
+dnsbl-query -d test.com 192.168.1.200 -v -q
+
+dnsbl-query -d test.com 2.0.0.127 -s 127.0.0.1:53
+
+### Example 5: Production Setup with systemd
+
+**/etc/systemd/system/dnsbl.service:**
+
+
+\[Unit\]
+
+Description=DNSBL Server
+
+After=network.target
+
+\[Service\]
+
+Type=simple
+
+ExecStart=/usr/local/bin/dnsbl-server \--config /etc/dnsbl/server.ini
+
+Restart=always
+
+User=dnsbl
+
+Group=dnsbl
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+\[Install\]
+
+WantedBy=multi-user.target
 
 ## Troubleshooting
 
-### Server Not Responding
+### Server Won\'t Start
 
-Check if port 53 is already in use:
-sudo netstat -tulpn | grep :53
+**Problem**: *Permission denied* on port 53
 
-### Remote DNSBLs Not Working
+**Solution**: Run as root or use *CAP_NET_BIND_SERVICE*:
 
-Enable verbose mode to see NS discovery logs:
-dnsbl-server -v -D bl.example.com -f dnsbl://zen.spamhaus.org ...
 
-Look for in logs:
-- Found NS servers - discovery successful
-- Failed to discover NS servers - discovery failed
+sudo setcap \'cap_net_bind_service=+ep\' /usr/local/bin/dnsbl-server
 
-### NOTIMP Responses
+### 
 
-Check if query type is supported (A for subdomains, A/NS/SOA/MX/TXT for domain).
+### 
 
-### Permission Issues
+### 
 
-To listen on privileged port 53:
-sudo ./dnsbl-server ...
+### DNSBL Forwarding Not Working
 
-Or use a non-privileged port for testing:
-./dnsbl-server -i 127.0.0.1:5453 ...
+**Problem**: Remote DNSBL queries consistently fail
+
+**Solutions**:
+
+1.  Check network connectivity to remote DNS servers
+2.  Verify the remote DNSBL domain is correct
+3.  Increase query timeout in configuration
+4.  Check DNS resolution of remote NS records
+
+### High Memory Usage
+
+**Solution**: Reduce blocklist size or increase reload interval:
+
+
+reload = 120 \# Reload less frequently
+
+### Rate Limiting Too Aggressive
+
+**Solutions**:
+
+1.  Increase *max-requests* value
+2.  Add trusted IPs to *no-request-limit*
+3.  Use *no-request-limit-file* for larger exempt lists
 
 ## License
 
-GPL
+This software is released under the GNU General Public License.
 
-## Author
-
-Philippe TEMESI
-
-## Version
-
-2.9.0 - 2026
-
-## Changelog
-
-### v2.9.0
-- Added configuration file support (INI format)
-- Added MX record support
-- Enhanced TXT record substitution (@dotted, @reversed)
-- Improved recursive NS discovery
-- Better error handling and logging
-
-### v2.8.0
-- Added TXT record support with IP substitution
-- Enhanced DNSBL forwarding with fallback resolvers
-- Improved cache management
-
-### v2.7.0
-- Added SOA record support
-- Improved NS discovery algorithm
-- Added round-robin load balancing
-
-### v2.6.0
-- Added trust-dns for reliable NS discovery
-- Enhanced DNSBL forwarding with authoritative server queries
-- Added comprehensive logging
-
-### v2.5.0
-- Initial release with multi-zone support
-- NS record support for self-domain
-- Rate limiting and query logging
-
-## Acknowledgments
-
-- The Rust community for excellent libraries
-- DNSBL operators for their services
-- Contributors and testers
-
-Note: For more information, visit https://www.tems.be
+Copyright (c) 2026, Philippe TEMESI - [https://www.tems.be](https://www.tems.be/)
